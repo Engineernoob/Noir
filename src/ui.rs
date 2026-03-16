@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::app::{App, FocusPane};
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -31,6 +31,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
             .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
             .split(body[0]);
 
+        let editor_height = top[1].height.saturating_sub(2) as usize;
+        let editor_width = top[1].width.saturating_sub(7) as usize;
+        app.set_editor_viewport(editor_height, editor_width);
+
         draw_file_tree(frame, top[0], app);
         draw_editor(frame, top[1], app);
         draw_terminal(frame, body[1], app);
@@ -39,6 +43,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
             .split(root[1]);
+
+        let editor_height = main[1].height.saturating_sub(2) as usize;
+        let editor_width = main[1].width.saturating_sub(7) as usize;
+        app.set_editor_viewport(editor_height, editor_width);
 
         draw_file_tree(frame, main[0], app);
         draw_editor(frame, main[1], app);

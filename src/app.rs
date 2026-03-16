@@ -28,6 +28,8 @@ pub struct App {
     pub focus: FocusPane,
     pub should_quit: bool,
     pub status: String,
+    pub editor_view_height: usize,
+    pub editor_view_width: usize,
 }
 
 impl App {
@@ -49,7 +51,16 @@ impl App {
             focus: FocusPane::FileTree,
             should_quit: false,
             status: format!("Noir ready — {}", root_dir.display()),
+            editor_view_height: 1,
+            editor_view_width: 1,
         })
+    }
+
+    pub fn set_editor_viewport(&mut self, height: usize, width: usize) {
+        self.editor_view_height = height.max(1);
+        self.editor_view_width = width.max(1);
+        self.editor
+            .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<Action> {
@@ -78,11 +89,15 @@ impl App {
                 }
                 KeyCode::Char('.') => {
                     self.editor.next_tab();
+                    self.editor
+                        .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
                     self.status = format!("Tab: {}", self.editor.title());
                     return Ok(Action::None);
                 }
                 KeyCode::Char(',') => {
                     self.editor.prev_tab();
+                    self.editor
+                        .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
                     self.status = format!("Tab: {}", self.editor.title());
                     return Ok(Action::None);
                 }
@@ -161,6 +176,8 @@ impl App {
             KeyCode::Enter => {
                 if let Some(path) = self.file_tree.selected_path() {
                     self.editor.open_file(path)?;
+                    self.editor
+                        .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
                     self.focus = FocusPane::Editor;
                     self.status = format!("Opened {}", path.display());
                     self.terminal
@@ -190,7 +207,8 @@ impl App {
             }
             _ => {
                 self.editor.handle_key(key);
-                self.editor.ensure_cursor_visible(20, 80);
+                self.editor
+                    .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
             }
         }
 
@@ -222,6 +240,8 @@ impl App {
                     if let Some(path) = self.file_tree.find_full_path_by_display(&selected) {
                         let path = path.clone();
                         self.editor.open_file(path)?;
+                        self.editor
+                            .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
                         self.status = format!("Opened {}", selected);
                         self.terminal
                             .push_line(format!("Palette opened file: {}", selected));
