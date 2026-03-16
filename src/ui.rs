@@ -168,11 +168,15 @@ fn draw_terminal(frame: &mut Frame, area: Rect, app: &App) {
     let inner_height = area.height.saturating_sub(2) as usize;
     let lines = app.terminal.visible_lines(inner_height);
 
-    let text: Vec<Line> = if lines.is_empty() {
+    let mut text: Vec<Line> = if lines.is_empty() {
         vec![Line::from("No output yet.")]
     } else {
         lines.into_iter().map(Line::from).collect()
     };
+
+    for diag in &app.diagnostics {
+        text.push(Line::from(format!("⚠ {}", diag)));
+    }
 
     let block = Block::default()
         .title(" Terminal ")

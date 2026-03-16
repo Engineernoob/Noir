@@ -4,9 +4,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
-    editor::Editor,
-    file_tree::FileTree,
-    palette::CommandPalette,
+    editor::Editor, file_tree::FileTree, lsp::LspClient, palette::CommandPalette,
     terminal::TerminalPane,
 };
 
@@ -30,6 +28,8 @@ pub struct App {
     pub editor: Editor,
     pub palette: CommandPalette,
     pub terminal: TerminalPane,
+    pub lsp: Option<LspClient>,
+    pub diagnostics: Vec<String>,
     pub focus: FocusPane,
     pub should_quit: bool,
     pub status: String,
@@ -50,12 +50,19 @@ impl App {
 
         terminal.init_shell()?;
 
+        let mut lsp = LspClient::start().ok();
+        if let Some(client) = lsp.as_mut() {
+            let _ = client.initialize();
+        }
+
         Ok(Self {
             root_dir: root_dir.clone(),
             file_tree,
             editor,
             palette: CommandPalette::default(),
             terminal,
+            lsp,
+            diagnostics: Vec::new(),
             focus: FocusPane::FileTree,
             should_quit: false,
             status: format!("Noir ready — {}", root_dir.display()),
@@ -66,6 +73,27 @@ impl App {
 
     pub fn tick(&mut self) {
         self.terminal.poll_output();
+
+        if let Some(lsp) = &mut self.lsp {
+            while let Ok(msg) = lsp.rx.try_recv() {
+                if msg.get("method").and_then(|m| m.as_str())
+                    == Some("textDocument/publishDiagnostics")
+                {
+                    self.diagnostics.clear();
+
+                    if let Some(params) = msg.get("params") {
+                        if let Some(diags) = params.get("diagnostics").and_then(|d| d.as_array()) {
+                            for diag in diags {
+                                if let Some(message) = diag.get("message").and_then(|m| m.as_str())
+                                {
+                                    self.diagnostics.push(message.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn set_editor_viewport(&mut self, height: usize, width: usize) {
@@ -189,9 +217,19 @@ impl App {
             KeyCode::Down => self.file_tree.move_down(),
             KeyCode::Enter => {
                 if let Some(path) = self.file_tree.selected_path() {
-                    self.editor.open_file(path)?;
+                    let path = path.clone();
+
+                    self.editor.open_file(&path)?;
                     self.editor
                         .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
+
+                    if let Some(lsp) = &mut self.lsp {
+                        if let Ok(text) = std::fs::read_to_string(&path) {
+                            let uri = format!("file://{}", path.display());
+                            let _ = lsp.open_file(uri, text);
+                        }
+                    }
+
                     self.focus = FocusPane::Editor;
                     self.status = format!("Opened {}", path.display());
                 }
@@ -247,9 +285,18 @@ impl App {
                 if let Some(selected) = selected {
                     if let Some(path) = self.file_tree.find_full_path_by_display(&selected) {
                         let path = path.clone();
-                        self.editor.open_file(path)?;
+
+                        self.editor.open_file(&path)?;
                         self.editor
                             .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
+
+                        if let Some(lsp) = &mut self.lsp {
+                            if let Ok(text) = std::fs::read_to_string(&path) {
+                                let uri = format!("file://{}", path.display());
+                                let _ = lsp.open_file(uri, text);
+                            }
+                        }
+
                         self.status = format!("Opened {}", selected);
                     }
                 }

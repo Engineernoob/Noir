@@ -1,6 +1,7 @@
 mod app;
 mod editor;
 mod file_tree;
+mod lsp;
 mod palette;
 mod terminal;
 mod ui;
