@@ -1,9 +1,9 @@
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs},
-    Frame,
 };
 
 use crate::app::{App, FocusPane};
@@ -20,13 +20,30 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     draw_tabs(frame, root[0], app);
 
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(root[1]);
+    if app.terminal.visible {
+        let body = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+            .split(root[1]);
 
-    draw_file_tree(frame, main[0], app);
-    draw_editor(frame, main[1], app);
+        let top = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .split(body[0]);
+
+        draw_file_tree(frame, top[0], app);
+        draw_editor(frame, top[1], app);
+        draw_terminal(frame, body[1], app);
+    } else {
+        let main = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .split(root[1]);
+
+        draw_file_tree(frame, main[0], app);
+        draw_editor(frame, main[1], app);
+    }
+
     draw_status(frame, root[2], app);
 
     if app.palette.open {
@@ -35,7 +52,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
-    let titles: Vec<Line> = app.editor.tab_titles().into_iter().map(Line::from).collect();
+    let titles: Vec<Line> = app
+        .editor
+        .tab_titles()
+        .into_iter()
+        .map(Line::from)
+        .collect();
 
     let tabs = Tabs::new(titles)
         .block(Block::default().borders(Borders::BOTTOM))
@@ -130,11 +152,35 @@ fn draw_editor(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+fn draw_terminal(frame: &mut Frame, area: Rect, app: &App) {
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let lines = app.terminal.visible_lines(inner_height);
+
+    let text: Vec<Line> = if lines.is_empty() {
+        vec![Line::from("No output yet.")]
+    } else {
+        lines.into_iter().map(Line::from).collect()
+    };
+
+    let block = Block::default()
+        .title(" Terminal ")
+        .borders(Borders::ALL)
+        .border_style(if app.focus == FocusPane::Terminal {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        });
+
+    let paragraph = Paragraph::new(text).block(block);
+    frame.render_widget(paragraph, area);
+}
+
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let focus = match app.focus {
         FocusPane::FileTree => "FILES",
         FocusPane::Editor => "EDITOR",
         FocusPane::Palette => "PALETTE",
+        FocusPane::Terminal => "TERMINAL",
     };
 
     let root = app
