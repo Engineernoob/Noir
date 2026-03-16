@@ -79,27 +79,35 @@ impl App {
                     self.palette.toggle();
 
                     if self.palette.open {
+                        self.palette
+                            .update_results(self.file_tree.all_display_paths());
                         self.focus = FocusPane::Palette;
-                        self.status = "Command palette".to_string();
+                        self.status = "File search".to_string();
                     } else {
                         self.focus = FocusPane::Editor;
-                        self.status = "Closed palette".to_string();
+                        self.status = "Closed file search".to_string();
                     }
-                    return Ok(Action::None);
-                }
-                KeyCode::Tab => {
-                    self.editor.next_tab();
-                    self.status = format!("Tab: {}", self.editor.title());
+
                     return Ok(Action::None);
                 }
                 _ => {}
             }
         }
 
-        if key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::BackTab) {
-            self.editor.prev_tab();
-            self.status = format!("Tab: {}", self.editor.title());
-            return Ok(Action::None);
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Char('.') => {
+                    self.editor.next_tab();
+                    self.status = format!("Tab: {}", self.editor.title());
+                    return Ok(Action::None);
+                }
+                KeyCode::Char(',') => {
+                    self.editor.prev_tab();
+                    self.status = format!("Tab: {}", self.editor.title());
+                    return Ok(Action::None);
+                }
+                _ => {}
+            }
         }
 
         match self.focus {
@@ -147,18 +155,33 @@ impl App {
             KeyCode::Esc => {
                 self.palette.close();
                 self.focus = FocusPane::Editor;
-                self.status = "Closed palette".to_string();
+                self.status = "Closed file search".to_string();
+            }
+            KeyCode::Up => {
+                self.palette.move_up();
+            }
+            KeyCode::Down => {
+                self.palette.move_down();
             }
             KeyCode::Backspace => {
                 self.palette.input.pop();
+                self.palette
+                    .update_results(self.file_tree.all_display_paths());
             }
             KeyCode::Enter => {
-                self.status = format!("Palette command: {}", self.palette.input);
+                if let Some(selected) = self.palette.selected_result() {
+                    if let Some(path) = self.file_tree.find_full_path_by_display(selected) {
+                        self.editor.open_file(path)?;
+                        self.status = format!("Opened {}", selected);
+                    }
+                }
                 self.palette.close();
                 self.focus = FocusPane::Editor;
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.palette.input.push(c);
+                self.palette
+                    .update_results(self.file_tree.all_display_paths());
             }
             _ => {}
         }

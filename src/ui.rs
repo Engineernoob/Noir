@@ -30,7 +30,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_status(frame, root[2], app);
 
     if app.palette.open {
-        draw_palette(frame, centered_rect(60, 20, frame.area()), app);
+        draw_palette(frame, centered_rect(70, 50, frame.area()), app);
     }
 }
 
@@ -190,17 +190,47 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_palette(frame: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default()
-        .title(" Command Palette ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow));
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(area);
 
     let input = Paragraph::new(app.palette.input.clone())
-        .block(block)
+        .block(
+            Block::default()
+                .title(" File Search ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
         .alignment(Alignment::Left);
 
+    let items: Vec<ListItem> = if app.palette.results.is_empty() {
+        vec![ListItem::new("No matches")]
+    } else {
+        app.palette
+            .results
+            .iter()
+            .map(|result| ListItem::new(result.clone()))
+            .collect()
+    };
+
+    let results = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(" Results "))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("› ");
+
+    let mut state = ListState::default();
+    if !app.palette.results.is_empty() {
+        state.select(Some(app.palette.selected));
+    }
+
     frame.render_widget(Clear, area);
-    frame.render_widget(input, area);
+    frame.render_widget(input, sections[0]);
+    frame.render_stateful_widget(results, sections[1], &mut state);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

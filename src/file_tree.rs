@@ -57,6 +57,20 @@ impl FileTree {
         self.entries.get(self.selected).map(|e| &e.full_path)
     }
 
+    pub fn all_display_paths(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .map(|e| e.display_path.clone())
+            .collect()
+    }
+
+    pub fn find_full_path_by_display(&self, display: &str) -> Option<&PathBuf> {
+        self.entries
+            .iter()
+            .find(|e| e.display_path == display)
+            .map(|e| &e.full_path)
+    }
+
     pub fn move_up(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;
@@ -76,10 +90,10 @@ fn should_skip(entry: &DirEntry) -> bool {
     for component in path.components() {
         if let Component::Normal(name) = component {
             if let Some(s) = name.to_str() {
-                if matches!(s, ".git" | "target" | "node_modules" | ".idea" | ".vscode") {
-                    return true;
-                }
-                if s.starts_with('.') && path != entry.path() {
+                if matches!(
+                    s,
+                    ".git" | "target" | "node_modules" | ".idea" | ".vscode"
+                ) {
                     return true;
                 }
             }
