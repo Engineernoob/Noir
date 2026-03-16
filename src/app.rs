@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{editor::Editor, file_tree::FileTree, palette::CommandPalette};
@@ -76,9 +76,15 @@ impl App {
                     return Ok(Action::None);
                 }
                 KeyCode::Char('p') => {
-                    self.palette.open();
-                    self.focus = FocusPane::Palette;
-                    self.status = "Command palette".to_string();
+                    self.palette.toggle();
+
+                    if self.palette.open {
+                        self.focus = FocusPane::Palette;
+                        self.status = "Command palette".to_string();
+                    } else {
+                        self.focus = FocusPane::Editor;
+                        self.status = "Closed palette".to_string();
+                    }
                     return Ok(Action::None);
                 }
                 KeyCode::Tab => {
