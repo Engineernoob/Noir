@@ -115,25 +115,27 @@ fn draw_file_tree(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_editor(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_editor(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner_height = area.height.saturating_sub(2) as usize;
     let inner_width = area.width.saturating_sub(7) as usize;
 
     let lines = app.editor.lines_for_render(inner_height, inner_width);
-    let buf = app.editor.current_buffer();
+    let scroll_y = app.editor.current_buffer().scroll_y;
 
     let text: Vec<Line> = lines
         .into_iter()
         .enumerate()
         .map(|(i, line)| {
-            let line_no = buf.scroll_y + i + 1;
-            Line::from(vec![
-                Span::styled(
-                    format!("{:>4} ", line_no),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(line),
-            ])
+            let line_no = scroll_y + i + 1;
+            let mut spans = vec![Span::styled(
+                format!("{:>4} ", line_no),
+                Style::default().fg(Color::DarkGray),
+            )];
+
+            let tokens = app.editor.syntax.highlight(&line);
+            spans.extend(highlighted_spans(&line, tokens));
+
+            Line::from(spans)
         })
         .collect();
 
@@ -162,6 +164,59 @@ fn draw_editor(frame: &mut Frame, area: Rect, app: &App) {
             frame.set_cursor_position((x, y));
         }
     }
+}
+
+fn token_style(kind: &str) -> Style {
+    match kind {
+        "comment" => Style::default().fg(Color::DarkGray),
+        "string" => Style::default().fg(Color::Green),
+        "type" => Style::default().fg(Color::Cyan),
+        "variable" => Style::default().fg(Color::White),
+        _ => Style::default().fg(Color::White),
+    }
+}
+
+fn highlighted_spans(line: &str, mut tokens: Vec<(usize, usize, &'static str)>) -> Vec<Span<'static>> {
+    tokens.sort_by_key(|(start, _, _)| *start);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cursor = 0usize;
+
+    for (start, end, kind) in tokens {
+        let start = start.min(line.len());
+        let end = end.min(line.len());
+
+        if start > cursor {
+            spans.push(Span::styled(
+                line[cursor..start].to_string(),
+                Style::default().fg(Color::White),
+            ));
+        }
+
+        if end > start {
+            spans.push(Span::styled(
+                line[start..end].to_string(),
+                token_style(kind),
+            ));
+            cursor = end;
+        }
+    }
+
+    if cursor < line.len() {
+        spans.push(Span::styled(
+            line[cursor..].to_string(),
+            Style::default().fg(Color::White),
+        ));
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(
+            line.to_string(),
+            Style::default().fg(Color::White),
+        ));
+    }
+
+    spans
 }
 
 fn draw_terminal(frame: &mut Frame, area: Rect, app: &App) {

@@ -3,6 +3,7 @@ mod editor;
 mod file_tree;
 mod lsp;
 mod palette;
+mod syntax;
 mod terminal;
 mod ui;
 mod util;

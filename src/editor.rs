@@ -6,6 +6,7 @@ use std::{
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ropey::Rope;
+use crate::syntax::SyntaxHighlighter;
 
 pub struct Buffer {
     pub file_path: Option<PathBuf>,
@@ -34,6 +35,7 @@ impl Default for Buffer {
 pub struct Editor {
     pub buffers: Vec<Buffer>,
     pub active: usize,
+    pub syntax: SyntaxHighlighter,
 }
 
 impl Default for Editor {
@@ -41,6 +43,7 @@ impl Default for Editor {
         Self {
             buffers: vec![Buffer::default()],
             active: 0,
+            syntax: SyntaxHighlighter::new(),
         }
     }
 }
