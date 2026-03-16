@@ -1,0 +1,11 @@
+[package]
+name = "noir"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.29"
+ratatui = "0.30"
+ropey = "1.6"
+walkdir = "2"
