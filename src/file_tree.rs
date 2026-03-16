@@ -1,10 +1,15 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
+
+pub struct FileEntry {
+    pub full_path: PathBuf,
+    pub display_path: String,
+}
 
 pub struct FileTree {
-    entries: Vec<PathBuf>,
+    entries: Vec<FileEntry>,
     selected: usize,
 }
 
@@ -14,16 +19,25 @@ impl FileTree {
 
         for entry in WalkDir::new(root)
             .into_iter()
+            .filter_entry(|e| !should_skip(e))
             .filter_map(Result::ok)
-            .filter(|e| !is_hidden(e.path()))
         {
             let path = entry.path().to_path_buf();
             if path.is_file() {
-                entries.push(path);
+                let display_path = path
+                    .strip_prefix(root)
+                    .ok()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+
+                entries.push(FileEntry {
+                    full_path: path,
+                    display_path,
+                });
             }
         }
 
-        entries.sort();
+        entries.sort_by(|a, b| a.display_path.cmp(&b.display_path));
 
         Ok(Self {
             entries,
@@ -31,7 +45,7 @@ impl FileTree {
         })
     }
 
-    pub fn entries(&self) -> &[PathBuf] {
+    pub fn entries(&self) -> &[FileEntry] {
         &self.entries
     }
 
@@ -40,7 +54,7 @@ impl FileTree {
     }
 
     pub fn selected_path(&self) -> Option<&PathBuf> {
-        self.entries.get(self.selected)
+        self.entries.get(self.selected).map(|e| &e.full_path)
     }
 
     pub fn move_up(&mut self) {
@@ -56,11 +70,21 @@ impl FileTree {
     }
 }
 
-fn is_hidden(path: &Path) -> bool {
-    path.components().any(|c| {
-        c.as_os_str()
-            .to_str()
-            .map(|s| s.starts_with('.'))
-            .unwrap_or(false)
-    })
+fn should_skip(entry: &DirEntry) -> bool {
+    let path = entry.path();
+
+    for component in path.components() {
+        if let Component::Normal(name) = component {
+            if let Some(s) = name.to_str() {
+                if matches!(s, ".git" | "target" | "node_modules" | ".idea" | ".vscode") {
+                    return true;
+                }
+                if s.starts_with('.') && path != entry.path() {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }

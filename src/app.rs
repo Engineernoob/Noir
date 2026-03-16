@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::{editor::Editor, file_tree::FileTree};
+use crate::{editor::Editor, file_tree::FileTree, palette::CommandPalette};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPane {
     FileTree,
     Editor,
+    Palette,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +22,7 @@ pub struct App {
     pub root_dir: PathBuf,
     pub file_tree: FileTree,
     pub editor: Editor,
+    pub palette: CommandPalette,
     pub focus: FocusPane,
     pub should_quit: bool,
     pub status: String,
@@ -32,23 +34,26 @@ impl App {
         let file_tree = FileTree::new(&root_dir)?;
         let mut editor = Editor::default();
 
-        let status = format!("Noir ready — {}", root_dir.display());
-
-        if let Some(first_file) = file_tree.selected_path().filter(|p| p.is_file()) {
+        if let Some(first_file) = file_tree.selected_path() {
             editor.open_file(first_file)?;
         }
 
         Ok(Self {
-            root_dir,
+            root_dir: root_dir.clone(),
             file_tree,
             editor,
+            palette: CommandPalette::default(),
             focus: FocusPane::FileTree,
             should_quit: false,
-            status,
+            status: format!("Noir ready — {}", root_dir.display()),
         })
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<Action> {
+        if self.palette.open {
+            return self.handle_palette_key(key);
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('q') => {
@@ -70,13 +75,31 @@ impl App {
                     self.status = "Focus: editor".to_string();
                     return Ok(Action::None);
                 }
+                KeyCode::Char('p') => {
+                    self.palette.open();
+                    self.focus = FocusPane::Palette;
+                    self.status = "Command palette".to_string();
+                    return Ok(Action::None);
+                }
+                KeyCode::Tab => {
+                    self.editor.next_tab();
+                    self.status = format!("Tab: {}", self.editor.title());
+                    return Ok(Action::None);
+                }
                 _ => {}
             }
+        }
+
+        if key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::BackTab) {
+            self.editor.prev_tab();
+            self.status = format!("Tab: {}", self.editor.title());
+            return Ok(Action::None);
         }
 
         match self.focus {
             FocusPane::FileTree => self.handle_file_tree_key(key),
             FocusPane::Editor => self.handle_editor_key(key),
+            FocusPane::Palette => self.handle_palette_key(key),
         }
     }
 
@@ -86,11 +109,9 @@ impl App {
             KeyCode::Down => self.file_tree.move_down(),
             KeyCode::Enter => {
                 if let Some(path) = self.file_tree.selected_path() {
-                    if path.is_file() {
-                        self.editor.open_file(path)?;
-                        self.focus = FocusPane::Editor;
-                        self.status = format!("Opened {}", path.display());
-                    }
+                    self.editor.open_file(path)?;
+                    self.focus = FocusPane::Editor;
+                    self.status = format!("Opened {}", path.display());
                 }
             }
             KeyCode::Tab => {
@@ -110,6 +131,30 @@ impl App {
                 self.status = "Focus: file tree".to_string();
             }
             _ => self.editor.handle_key(key),
+        }
+
+        Ok(Action::None)
+    }
+
+    fn handle_palette_key(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                self.palette.close();
+                self.focus = FocusPane::Editor;
+                self.status = "Closed palette".to_string();
+            }
+            KeyCode::Backspace => {
+                self.palette.input.pop();
+            }
+            KeyCode::Enter => {
+                self.status = format!("Palette command: {}", self.palette.input);
+                self.palette.close();
+                self.focus = FocusPane::Editor;
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.palette.input.push(c);
+            }
+            _ => {}
         }
 
         Ok(Action::None)

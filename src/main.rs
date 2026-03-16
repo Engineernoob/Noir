@@ -1,6 +1,7 @@
 mod app;
 mod editor;
 mod file_tree;
+mod palette;
 mod ui;
 mod util;
 
