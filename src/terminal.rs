@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::Result;
-use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
+use portable_pty::{CommandBuilder, PtyPair, PtySize, native_pty_system};
 
 pub struct TerminalPane {
     pub visible: bool,

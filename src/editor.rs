@@ -3,14 +3,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::syntax::SyntaxHighlighter;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ropey::Rope;
-use crate::syntax::SyntaxHighlighter;
 
 pub struct Buffer {
     pub file_path: Option<PathBuf>,
     pub rope: Rope,
+    pub version: i32,
     pub cursor_row: usize,
     pub cursor_col: usize,
     pub scroll_y: usize,
@@ -23,6 +24,7 @@ impl Default for Buffer {
         Self {
             file_path: None,
             rope: Rope::new(),
+            version: 0,
             cursor_row: 0,
             cursor_col: 0,
             scroll_y: 0,
@@ -65,6 +67,7 @@ impl Editor {
         let buffer = Buffer {
             file_path: Some(path),
             rope: Rope::from_str(&content),
+            version: 1,
             cursor_row: 0,
             cursor_col: 0,
             scroll_y: 0,
@@ -110,7 +113,7 @@ impl Editor {
         &mut self.buffers[self.active]
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) {
+    pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Up => self.move_up(),
             KeyCode::Down => self.move_down(),
@@ -120,13 +123,15 @@ impl Editor {
             KeyCode::End => self.move_end(),
             KeyCode::PageUp => self.page_up(),
             KeyCode::PageDown => self.page_down(),
-            KeyCode::Backspace => self.backspace(),
-            KeyCode::Enter => self.insert_char('\n'),
+            KeyCode::Backspace => return self.backspace(),
+            KeyCode::Enter => return self.insert_char('\n'),
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.insert_char(c);
+                return self.insert_char(c);
             }
             _ => {}
         }
+
+        false
     }
 
     pub fn title(&self) -> String {
@@ -221,6 +226,34 @@ impl Editor {
         )
     }
 
+    pub fn current_buffer_text(&self) -> String {
+        self.current_buffer().rope.to_string()
+    }
+
+    pub fn current_lsp_position(&self) -> (u32, u32) {
+        let buf = self.current_buffer();
+        (
+            buf.cursor_row as u32,
+            self.utf8_character_for_col(buf.cursor_row, buf.cursor_col) as u32,
+        )
+    }
+
+    pub fn set_cursor_from_lsp(&mut self, row: usize, character: usize) {
+        let total_lines = self.current_buffer().rope.len_lines();
+        if total_lines == 0 {
+            let buf = self.current_buffer_mut();
+            buf.cursor_row = 0;
+            buf.cursor_col = 0;
+            return;
+        }
+
+        let safe_row = row.min(total_lines.saturating_sub(1));
+        let safe_col = self.col_for_utf8_character(safe_row, character);
+        let buf = self.current_buffer_mut();
+        buf.cursor_row = safe_row;
+        buf.cursor_col = safe_col;
+    }
+
     fn line_len_chars(&self, row: usize) -> usize {
         let buf = self.current_buffer();
         if row >= buf.rope.len_lines() {
@@ -246,7 +279,7 @@ impl Editor {
         line_start + col.min(self.line_len_chars(row))
     }
 
-    fn insert_char(&mut self, ch: char) {
+    fn insert_char(&mut self, ch: char) -> bool {
         let idx = {
             let buf = self.current_buffer();
             if buf.rope.len_lines() == 0 {
@@ -258,6 +291,7 @@ impl Editor {
 
         let buf = self.current_buffer_mut();
         buf.rope.insert_char(idx, ch);
+        buf.version += 1;
         buf.dirty = true;
 
         if ch == '\n' {
@@ -266,16 +300,18 @@ impl Editor {
         } else {
             buf.cursor_col += 1;
         }
+
+        true
     }
 
-    fn backspace(&mut self) {
+    fn backspace(&mut self) -> bool {
         {
             let buf = self.current_buffer();
             if buf.rope.len_chars() == 0 {
-                return;
+                return false;
             }
             if buf.cursor_row == 0 && buf.cursor_col == 0 {
-                return;
+                return false;
             }
         }
 
@@ -285,12 +321,13 @@ impl Editor {
         };
 
         if idx == 0 {
-            return;
+            return false;
         }
 
         {
             let buf = self.current_buffer_mut();
             buf.rope.remove((idx - 1)..idx);
+            buf.version += 1;
             buf.dirty = true;
         }
 
@@ -304,6 +341,8 @@ impl Editor {
             buf.cursor_row = prev_row;
             buf.cursor_col = prev_len;
         }
+
+        true
     }
 
     fn move_up(&mut self) {
@@ -392,5 +431,48 @@ impl Editor {
         let len = self.line_len_chars(row);
         let current_col = self.current_buffer().cursor_col;
         self.current_buffer_mut().cursor_col = current_col.min(len);
+    }
+
+    fn utf8_character_for_col(&self, row: usize, col: usize) -> usize {
+        let buf = self.current_buffer();
+        if row >= buf.rope.len_lines() {
+            return 0;
+        }
+
+        buf.rope
+            .line(row)
+            .to_string()
+            .trim_end_matches('\n')
+            .chars()
+            .take(col)
+            .map(char::len_utf8)
+            .sum()
+    }
+
+    fn col_for_utf8_character(&self, row: usize, character: usize) -> usize {
+        let buf = self.current_buffer();
+        if row >= buf.rope.len_lines() {
+            return 0;
+        }
+
+        let mut bytes = 0usize;
+        let mut cols = 0usize;
+
+        for ch in buf
+            .rope
+            .line(row)
+            .to_string()
+            .trim_end_matches('\n')
+            .chars()
+        {
+            if bytes >= character {
+                break;
+            }
+
+            bytes += ch.len_utf8();
+            cols += 1;
+        }
+
+        cols
     }
 }

@@ -90,10 +90,7 @@ fn should_skip(entry: &DirEntry) -> bool {
     for component in path.components() {
         if let Component::Normal(name) = component {
             if let Some(s) = name.to_str() {
-                if matches!(
-                    s,
-                    ".git" | "target" | "node_modules" | ".idea" | ".vscode"
-                ) {
+                if matches!(s, ".git" | "target" | "node_modules" | ".idea" | ".vscode") {
                     return true;
                 }
             }

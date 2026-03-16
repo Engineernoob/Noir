@@ -176,7 +176,10 @@ fn token_style(kind: &str) -> Style {
     }
 }
 
-fn highlighted_spans(line: &str, mut tokens: Vec<(usize, usize, &'static str)>) -> Vec<Span<'static>> {
+fn highlighted_spans(
+    line: &str,
+    mut tokens: Vec<(usize, usize, &'static str)>,
+) -> Vec<Span<'static>> {
     tokens.sort_by_key(|(start, _, _)| *start);
 
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -229,7 +232,7 @@ fn draw_terminal(frame: &mut Frame, area: Rect, app: &App) {
         lines.into_iter().map(Line::from).collect()
     };
 
-    for diag in &app.diagnostics {
+    for diag in app.diagnostic_lines() {
         text.push(Line::from(format!("⚠ {}", diag)));
     }
 

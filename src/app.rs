@@ -4,7 +4,10 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
-    editor::Editor, file_tree::FileTree, lsp::LspClient, palette::CommandPalette,
+    editor::Editor,
+    file_tree::FileTree,
+    lsp::{LspClient, LspDiagnostic, LspEvent, LspLocation},
+    palette::CommandPalette,
     terminal::TerminalPane,
 };
 
@@ -29,7 +32,7 @@ pub struct App {
     pub palette: CommandPalette,
     pub terminal: TerminalPane,
     pub lsp: Option<LspClient>,
-    pub diagnostics: Vec<String>,
+    pub diagnostics: Vec<LspDiagnostic>,
     pub focus: FocusPane,
     pub should_quit: bool,
     pub status: String,
@@ -50,12 +53,12 @@ impl App {
 
         terminal.init_shell()?;
 
-        let mut lsp = LspClient::start().ok();
+        let mut lsp = LspClient::start(&root_dir).ok();
         if let Some(client) = lsp.as_mut() {
             let _ = client.initialize();
         }
 
-        Ok(Self {
+        let mut app = Self {
             root_dir: root_dir.clone(),
             file_tree,
             editor,
@@ -68,31 +71,24 @@ impl App {
             status: format!("Noir ready — {}", root_dir.display()),
             editor_view_height: 1,
             editor_view_width: 1,
-        })
+        };
+
+        let _ = app.sync_current_buffer_with_lsp();
+
+        Ok(app)
     }
 
     pub fn tick(&mut self) {
         self.terminal.poll_output();
 
-        if let Some(lsp) = &mut self.lsp {
-            while let Ok(msg) = lsp.rx.try_recv() {
-                if msg.get("method").and_then(|m| m.as_str())
-                    == Some("textDocument/publishDiagnostics")
-                {
-                    self.diagnostics.clear();
+        let events = if let Some(lsp) = &mut self.lsp {
+            lsp.drain_events()
+        } else {
+            Vec::new()
+        };
 
-                    if let Some(params) = msg.get("params") {
-                        if let Some(diags) = params.get("diagnostics").and_then(|d| d.as_array()) {
-                            for diag in diags {
-                                if let Some(message) = diag.get("message").and_then(|m| m.as_str())
-                                {
-                                    self.diagnostics.push(message.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        for event in events {
+            self.apply_lsp_event(event);
         }
     }
 
@@ -135,6 +131,7 @@ impl App {
                     self.editor.next_tab();
                     self.editor
                         .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
+                    let _ = self.sync_current_buffer_with_lsp();
                     self.status = format!("Tab: {}", self.editor.title());
                     return Ok(Action::None);
                 }
@@ -142,6 +139,7 @@ impl App {
                     self.editor.prev_tab();
                     self.editor
                         .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
+                    let _ = self.sync_current_buffer_with_lsp();
                     self.status = format!("Tab: {}", self.editor.title());
                     return Ok(Action::None);
                 }
@@ -185,6 +183,14 @@ impl App {
 
                     return Ok(Action::None);
                 }
+                KeyCode::Char('k') => {
+                    self.request_hover()?;
+                    return Ok(Action::None);
+                }
+                KeyCode::Char('g') => {
+                    self.request_definition()?;
+                    return Ok(Action::None);
+                }
                 KeyCode::Char('t') => {
                     self.terminal.toggle();
 
@@ -222,13 +228,7 @@ impl App {
                     self.editor.open_file(&path)?;
                     self.editor
                         .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
-
-                    if let Some(lsp) = &mut self.lsp {
-                        if let Ok(text) = std::fs::read_to_string(&path) {
-                            let uri = format!("file://{}", path.display());
-                            let _ = lsp.open_file(uri, text);
-                        }
-                    }
+                    let _ = self.sync_current_buffer_with_lsp();
 
                     self.focus = FocusPane::Editor;
                     self.status = format!("Opened {}", path.display());
@@ -256,9 +256,13 @@ impl App {
                 }
             }
             _ => {
-                self.editor.handle_key(key);
+                let changed = self.editor.handle_key(key);
                 self.editor
                     .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
+
+                if changed {
+                    self.sync_current_buffer_change()?;
+                }
             }
         }
 
@@ -289,13 +293,7 @@ impl App {
                         self.editor.open_file(&path)?;
                         self.editor
                             .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
-
-                        if let Some(lsp) = &mut self.lsp {
-                            if let Ok(text) = std::fs::read_to_string(&path) {
-                                let uri = format!("file://{}", path.display());
-                                let _ = lsp.open_file(uri, text);
-                            }
-                        }
+                        let _ = self.sync_current_buffer_with_lsp();
 
                         self.status = format!("Opened {}", selected);
                     }
@@ -341,4 +339,135 @@ impl App {
 
         Ok(Action::None)
     }
+
+    pub fn diagnostic_lines(&self) -> Vec<String> {
+        let current_path = self.editor.current_buffer().file_path.as_ref();
+
+        self.diagnostics
+            .iter()
+            .filter(|diagnostic| current_path == Some(&diagnostic.path))
+            .map(LspDiagnostic::summary)
+            .collect()
+    }
+
+    fn apply_lsp_event(&mut self, event: LspEvent) {
+        match event {
+            LspEvent::Diagnostics { uri, diagnostics } => {
+                self.diagnostics.retain(|existing| existing.uri != uri);
+                self.diagnostics.extend(diagnostics);
+            }
+            LspEvent::Hover { contents } => {
+                self.status = match contents {
+                    Some(contents) => format!("Hover: {}", truncate(&contents, 120)),
+                    None => "Hover: no information".to_string(),
+                };
+            }
+            LspEvent::Definition { location } => {
+                if let Some(location) = location {
+                    if let Err(err) = self.open_definition(location) {
+                        self.status = format!("Definition failed: {err}");
+                    }
+                } else {
+                    self.status = "Definition: no result".to_string();
+                }
+            }
+            LspEvent::Status(message) => {
+                self.status = message;
+            }
+        }
+    }
+
+    fn sync_current_buffer_with_lsp(&mut self) -> Result<()> {
+        let Some((path, text, version)) = self.current_document_snapshot() else {
+            return Ok(());
+        };
+
+        if let Some(lsp) = &mut self.lsp {
+            lsp.open_document(&path, &text, version)?;
+        }
+
+        Ok(())
+    }
+
+    fn sync_current_buffer_change(&mut self) -> Result<()> {
+        let Some((path, text, version)) = self.current_document_snapshot() else {
+            return Ok(());
+        };
+
+        if let Some(lsp) = &mut self.lsp {
+            lsp.change_document(&path, &text, version)?;
+        }
+
+        Ok(())
+    }
+
+    fn request_hover(&mut self) -> Result<()> {
+        let Some((path, text, version)) = self.current_document_snapshot() else {
+            self.status = "Hover: no file open".to_string();
+            return Ok(());
+        };
+
+        let (line, character) = self.editor.current_lsp_position();
+
+        if let Some(lsp) = &mut self.lsp {
+            lsp.open_document(&path, &text, version)?;
+            lsp.request_hover(&path, line, character)?;
+            self.status = "Hover requested".to_string();
+        } else {
+            self.status = "LSP unavailable".to_string();
+        }
+
+        Ok(())
+    }
+
+    fn request_definition(&mut self) -> Result<()> {
+        let Some((path, text, version)) = self.current_document_snapshot() else {
+            self.status = "Definition: no file open".to_string();
+            return Ok(());
+        };
+
+        let (line, character) = self.editor.current_lsp_position();
+
+        if let Some(lsp) = &mut self.lsp {
+            lsp.open_document(&path, &text, version)?;
+            lsp.request_definition(&path, line, character)?;
+            self.status = "Definition requested".to_string();
+        } else {
+            self.status = "LSP unavailable".to_string();
+        }
+
+        Ok(())
+    }
+
+    fn open_definition(&mut self, location: LspLocation) -> Result<()> {
+        self.editor.open_file(&location.path)?;
+        self.editor
+            .set_cursor_from_lsp(location.line as usize, location.character as usize);
+        self.editor
+            .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
+        self.sync_current_buffer_with_lsp()?;
+        self.focus = FocusPane::Editor;
+        self.status = format!(
+            "Definition: {}:{}",
+            location.path.display(),
+            location.line + 1
+        );
+        Ok(())
+    }
+
+    fn current_document_snapshot(&self) -> Option<(PathBuf, String, i32)> {
+        let buffer = self.editor.current_buffer();
+        let path = buffer.file_path.clone()?;
+        Some((path, self.editor.current_buffer_text(), buffer.version))
+    }
+}
+
+fn truncate(text: &str, max_len: usize) -> String {
+    let mut truncated = text.chars().take(max_len).collect::<String>();
+
+    if text.chars().count() > max_len {
+        truncated.push_str("...");
+    }
+
+    truncated
 }
