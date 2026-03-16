@@ -1,9 +1,9 @@
 use ratatui::{
-    Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs},
+    Frame,
 };
 
 use crate::app::{App, FocusPane};
@@ -35,12 +35,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
-    let titles: Vec<Line> = app
-        .editor
-        .tab_titles()
-        .into_iter()
-        .map(Line::from)
-        .collect();
+    let titles: Vec<Line> = app.editor.tab_titles().into_iter().map(Line::from).collect();
 
     let tabs = Tabs::new(titles)
         .block(Block::default().borders(Borders::BOTTOM))
@@ -88,7 +83,9 @@ fn draw_file_tree(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_editor(frame: &mut Frame, area: Rect, app: &App) {
     let inner_height = area.height.saturating_sub(2) as usize;
-    let lines = app.editor.lines_for_render(inner_height);
+    let inner_width = area.width.saturating_sub(7) as usize;
+
+    let lines = app.editor.lines_for_render(inner_height, inner_width);
     let buf = app.editor.current_buffer();
 
     let text: Vec<Line> = lines
@@ -117,6 +114,20 @@ fn draw_editor(frame: &mut Frame, area: Rect, app: &App) {
 
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, area);
+
+    if app.focus == FocusPane::Editor {
+        let (cursor_y, cursor_x) = app.editor.cursor_screen_position();
+
+        let x = area.x + 1 + 5 + cursor_x as u16;
+        let y = area.y + 1 + cursor_y as u16;
+
+        let max_x = area.x + area.width.saturating_sub(2);
+        let max_y = area.y + area.height.saturating_sub(2);
+
+        if x <= max_x && y <= max_y {
+            frame.set_cursor_position((x, y));
+        }
+    }
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
@@ -129,18 +140,18 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let root = app
         .root_dir
         .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(".");
+        .map(|s: &std::ffi::OsStr| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string());
 
     let buf = app.editor.current_buffer();
 
     let file = buf
         .file_path
         .as_ref()
-        .map(|p| {
+        .map(|p: &std::path::PathBuf| {
             p.strip_prefix(&app.root_dir)
                 .ok()
-                .map(|rel| rel.display().to_string())
+                .map(|rel: &std::path::Path| rel.display().to_string())
                 .unwrap_or_else(|| p.display().to_string())
         })
         .unwrap_or_else(|| "[no file]".to_string());

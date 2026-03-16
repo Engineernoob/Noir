@@ -144,7 +144,10 @@ impl App {
                 self.focus = FocusPane::FileTree;
                 self.status = "Focus: file tree".to_string();
             }
-            _ => self.editor.handle_key(key),
+            _ => {
+                self.editor.handle_key(key);
+                self.editor.ensure_cursor_visible(20, 80);
+            }
         }
 
         Ok(Action::None)
