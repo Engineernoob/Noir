@@ -35,6 +35,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let editor_width = top[1].width.saturating_sub(7) as usize;
         app.set_editor_viewport(editor_height, editor_width);
 
+        let terminal_rows = body[1].height.saturating_sub(2);
+        let terminal_cols = body[1].width.saturating_sub(2);
+        app.resize_terminal_viewport(terminal_rows, terminal_cols);
+
         draw_file_tree(frame, top[0], app);
         draw_editor(frame, top[1], app);
         draw_terminal(frame, body[1], app);

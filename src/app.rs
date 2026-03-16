@@ -3,7 +3,12 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::{editor::Editor, file_tree::FileTree, palette::CommandPalette, terminal::TerminalPane};
+use crate::{
+    editor::Editor,
+    file_tree::FileTree,
+    palette::CommandPalette,
+    terminal::TerminalPane,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPane {
@@ -37,17 +42,20 @@ impl App {
         let root_dir = root.as_ref().canonicalize()?;
         let file_tree = FileTree::new(&root_dir)?;
         let mut editor = Editor::default();
+        let mut terminal = TerminalPane::new();
 
         if let Some(first_file) = file_tree.selected_path() {
             editor.open_file(first_file)?;
         }
+
+        terminal.init_shell()?;
 
         Ok(Self {
             root_dir: root_dir.clone(),
             file_tree,
             editor,
             palette: CommandPalette::default(),
-            terminal: TerminalPane::new(),
+            terminal,
             focus: FocusPane::FileTree,
             should_quit: false,
             status: format!("Noir ready — {}", root_dir.display()),
@@ -56,11 +64,19 @@ impl App {
         })
     }
 
+    pub fn tick(&mut self) {
+        self.terminal.poll_output();
+    }
+
     pub fn set_editor_viewport(&mut self, height: usize, width: usize) {
         self.editor_view_height = height.max(1);
         self.editor_view_width = width.max(1);
         self.editor
             .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
+    }
+
+    pub fn resize_terminal_viewport(&mut self, rows: u16, cols: u16) {
+        self.terminal.resize(rows.max(1), cols.max(1));
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<Action> {
@@ -114,7 +130,6 @@ impl App {
                 KeyCode::Char('s') => {
                     self.editor.save()?;
                     self.status = "Saved file".to_string();
-                    self.terminal.push_line("Saved current file.");
                     return Ok(Action::None);
                 }
                 KeyCode::Char('b') => {
@@ -147,7 +162,6 @@ impl App {
 
                     if self.terminal.visible {
                         self.status = "Opened terminal pane".to_string();
-                        self.terminal.push_line("Terminal pane opened.");
                     } else {
                         if self.focus == FocusPane::Terminal {
                             self.focus = FocusPane::Editor;
@@ -180,8 +194,6 @@ impl App {
                         .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
                     self.focus = FocusPane::Editor;
                     self.status = format!("Opened {}", path.display());
-                    self.terminal
-                        .push_line(format!("Opened file: {}", path.display()));
                 }
             }
             KeyCode::Tab => {
@@ -222,12 +234,8 @@ impl App {
                 self.focus = FocusPane::Editor;
                 self.status = "Closed file search".to_string();
             }
-            KeyCode::Up => {
-                self.palette.move_up();
-            }
-            KeyCode::Down => {
-                self.palette.move_down();
-            }
+            KeyCode::Up => self.palette.move_up(),
+            KeyCode::Down => self.palette.move_down(),
             KeyCode::Backspace => {
                 self.palette.input.pop();
                 self.palette
@@ -243,8 +251,6 @@ impl App {
                         self.editor
                             .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
                         self.status = format!("Opened {}", selected);
-                        self.terminal
-                            .push_line(format!("Palette opened file: {}", selected));
                     }
                 }
 
@@ -271,14 +277,18 @@ impl App {
                 self.status = "Focus: file tree".to_string();
             }
             KeyCode::Enter => {
-                self.terminal
-                    .push_line("Terminal placeholder received Enter.");
-                self.status = "Terminal input placeholder".to_string();
+                self.terminal.send_enter();
+            }
+            KeyCode::Backspace => {
+                self.terminal.send_backspace();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.terminal
-                    .push_line(format!("Terminal placeholder input: {}", c));
+                self.terminal.send_key_char(c);
             }
+            KeyCode::Left => self.terminal.send_input("\u{1b}[D"),
+            KeyCode::Right => self.terminal.send_input("\u{1b}[C"),
+            KeyCode::Home => self.terminal.send_input("\u{1b}[H"),
+            KeyCode::End => self.terminal.send_input("\u{1b}[F"),
             _ => {}
         }
 
