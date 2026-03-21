@@ -234,24 +234,8 @@ impl Editor {
         let buf = self.current_buffer();
         (
             buf.cursor_row as u32,
-            self.utf8_character_for_col(buf.cursor_row, buf.cursor_col) as u32,
+            self.utf8_offset_for_col(buf.cursor_row, buf.cursor_col) as u32,
         )
-    }
-
-    pub fn set_cursor_from_lsp(&mut self, row: usize, character: usize) {
-        let total_lines = self.current_buffer().rope.len_lines();
-        if total_lines == 0 {
-            let buf = self.current_buffer_mut();
-            buf.cursor_row = 0;
-            buf.cursor_col = 0;
-            return;
-        }
-
-        let safe_row = row.min(total_lines.saturating_sub(1));
-        let safe_col = self.col_for_utf8_character(safe_row, character);
-        let buf = self.current_buffer_mut();
-        buf.cursor_row = safe_row;
-        buf.cursor_col = safe_col;
     }
 
     fn line_len_chars(&self, row: usize) -> usize {
@@ -433,7 +417,7 @@ impl Editor {
         self.current_buffer_mut().cursor_col = current_col.min(len);
     }
 
-    fn utf8_character_for_col(&self, row: usize, col: usize) -> usize {
+    fn utf8_offset_for_col(&self, row: usize, col: usize) -> usize {
         let buf = self.current_buffer();
         if row >= buf.rope.len_lines() {
             return 0;
@@ -447,32 +431,5 @@ impl Editor {
             .take(col)
             .map(char::len_utf8)
             .sum()
-    }
-
-    fn col_for_utf8_character(&self, row: usize, character: usize) -> usize {
-        let buf = self.current_buffer();
-        if row >= buf.rope.len_lines() {
-            return 0;
-        }
-
-        let mut bytes = 0usize;
-        let mut cols = 0usize;
-
-        for ch in buf
-            .rope
-            .line(row)
-            .to_string()
-            .trim_end_matches('\n')
-            .chars()
-        {
-            if bytes >= character {
-                break;
-            }
-
-            bytes += ch.len_utf8();
-            cols += 1;
-        }
-
-        cols
     }
 }

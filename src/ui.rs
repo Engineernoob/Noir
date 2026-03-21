@@ -6,7 +6,10 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs},
 };
 
-use crate::app::{App, FocusPane};
+use crate::{
+    app::{App, FocusPane},
+    lsp::DiagnosticSeverity,
+};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let root = Layout::default()
@@ -20,7 +23,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     draw_tabs(frame, root[0], app);
 
-    if app.terminal.visible {
+    // Bottom pane is visible if either terminal or diagnostics is open.
+    let show_bottom = app.terminal.visible || app.diagnostics_open;
+
+    if show_bottom {
         let body = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
@@ -35,13 +41,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let editor_width = top[1].width.saturating_sub(7) as usize;
         app.set_editor_viewport(editor_height, editor_width);
 
-        let terminal_rows = body[1].height.saturating_sub(2);
-        let terminal_cols = body[1].width.saturating_sub(2);
-        app.resize_terminal_viewport(terminal_rows, terminal_cols);
-
         draw_file_tree(frame, top[0], app);
         draw_editor(frame, top[1], app);
-        draw_terminal(frame, body[1], app);
+
+        if app.diagnostics_open {
+            draw_diagnostics(frame, body[1], app);
+        } else {
+            let terminal_rows = body[1].height.saturating_sub(2);
+            let terminal_cols = body[1].width.saturating_sub(2);
+            app.resize_terminal_viewport(terminal_rows, terminal_cols);
+            draw_terminal(frame, body[1], app);
+        }
     } else {
         let main = Layout::default()
             .direction(Direction::Horizontal)
@@ -60,6 +70,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.palette.open {
         draw_palette(frame, centered_rect(70, 50, frame.area()), app);
+    }
+
+    if app.hover_visible {
+        draw_hover(frame, centered_rect(60, 40, frame.area()), app);
     }
 }
 
@@ -88,7 +102,25 @@ fn draw_file_tree(frame: &mut Frame, area: Rect, app: &App) {
         .file_tree
         .entries()
         .iter()
-        .map(|entry| ListItem::new(entry.display_path.clone()))
+        .map(|entry| {
+            let indent = "  ".repeat(entry.depth);
+
+            let (icon, label, style) = if entry.is_dir {
+                let icon = if entry.expanded { "▼ " } else { "▶ " };
+                let label = format!("{}/", entry.name);
+                let style = Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD);
+                (icon, label, style)
+            } else {
+                ("  ", entry.name.clone(), Style::default().fg(Color::White))
+            };
+
+            ListItem::new(Span::styled(
+                format!("{indent}{icon}{label}"),
+                style,
+            ))
+        })
         .collect();
 
     let block = Block::default()
@@ -107,7 +139,7 @@ fn draw_file_tree(frame: &mut Frame, area: Rect, app: &App) {
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("› ");
+        .highlight_symbol("›");
 
     let mut state = ListState::default();
     state.select(Some(app.file_tree.selected_index()));
@@ -166,6 +198,292 @@ fn draw_editor(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+fn draw_terminal(frame: &mut Frame, area: Rect, app: &App) {
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let lines = app.terminal.visible_lines(inner_height);
+
+    let text: Vec<Line> = if lines.is_empty() {
+        vec![Line::from("No output yet.")]
+    } else {
+        lines.into_iter().map(Line::from).collect()
+    };
+
+    let block = Block::default()
+        .title(" Terminal ")
+        .borders(Borders::ALL)
+        .border_style(if app.focus == FocusPane::Terminal {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        });
+
+    let paragraph = Paragraph::new(text).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_diagnostics(frame: &mut Frame, area: Rect, app: &App) {
+    let is_focused = app.focus == FocusPane::Diagnostics;
+    let error_count = app.diagnostic_error_count();
+    let warning_count = app.diagnostic_warning_count();
+
+    let title = if app.diagnostics_entries.is_empty() {
+        " Diagnostics — no issues ".to_string()
+    } else {
+        let mut parts: Vec<String> = Vec::new();
+        if error_count > 0 {
+            parts.push(format!(
+                "{} error{}",
+                error_count,
+                if error_count == 1 { "" } else { "s" }
+            ));
+        }
+        if warning_count > 0 {
+            parts.push(format!(
+                "{} warning{}",
+                warning_count,
+                if warning_count == 1 { "" } else { "s" }
+            ));
+        }
+        let other = app.diagnostics_entries.len() - error_count - warning_count;
+        if other > 0 {
+            parts.push(format!("{} hint{}", other, if other == 1 { "" } else { "s" }));
+        }
+        format!(" Diagnostics — {} ", parts.join(", "))
+    };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(if is_focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        });
+
+    let items: Vec<ListItem> = if app.diagnostics_entries.is_empty() {
+        vec![ListItem::new(Line::from(vec![Span::styled(
+            "  No diagnostics",
+            Style::default().fg(Color::Green),
+        )]))]
+    } else {
+        app.diagnostics_entries
+            .iter()
+            .map(|entry| {
+                let (badge, badge_style) = severity_badge(entry.severity);
+
+                let rel_path = entry
+                    .path
+                    .strip_prefix(&app.root_dir)
+                    .ok()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| entry.path.display().to_string());
+
+                let location = format!("{}:{}", rel_path, entry.line + 1);
+                let msg = truncate_str(&entry.message, 55);
+
+                ListItem::new(Line::from(vec![
+                    Span::styled(badge, badge_style),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("{location:<32}"),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(msg, Style::default().fg(Color::Gray)),
+                ]))
+            })
+            .collect()
+    };
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("›");
+
+    let mut state = ListState::default();
+    if !app.diagnostics_entries.is_empty() {
+        state.select(Some(app.diagnostics_selected));
+    }
+
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
+    let focus_label = match app.focus {
+        FocusPane::FileTree => "FILES",
+        FocusPane::Editor => "EDITOR",
+        FocusPane::Palette => "PALETTE",
+        FocusPane::Terminal => "TERMINAL",
+        FocusPane::Diagnostics => "DIAG",
+    };
+
+    let root = app
+        .root_dir
+        .file_name()
+        .map(|s: &std::ffi::OsStr| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string());
+
+    let buf = app.editor.current_buffer();
+
+    let file = buf
+        .file_path
+        .as_ref()
+        .map(|p: &std::path::PathBuf| {
+            p.strip_prefix(&app.root_dir)
+                .ok()
+                .map(|rel: &std::path::Path| rel.display().to_string())
+                .unwrap_or_else(|| p.display().to_string())
+        })
+        .unwrap_or_else(|| "[no file]".to_string());
+
+    let position = format!("Ln {}, Col {}", buf.cursor_row + 1, buf.cursor_col + 1);
+    let dirty = if buf.dirty { "MOD" } else { "OK" };
+
+    let error_count = app.diagnostic_error_count();
+    let warning_count = app.diagnostic_warning_count();
+
+    let mut spans = vec![
+        Span::styled(
+            format!(" {} ", focus_label),
+            Style::default()
+                .bg(Color::Black)
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("root:{} ", root),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("| "),
+        Span::raw(format!("file:{} ", file)),
+        Span::raw("| "),
+        Span::styled(position, Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" | "),
+        Span::styled(
+            format!(" {} ", dirty),
+            if buf.dirty {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            },
+        ),
+        Span::raw(" "),
+    ];
+
+    // Diagnostic counts — only shown when LSP is active.
+    if app.lsp.is_some() {
+        if error_count > 0 {
+            spans.push(Span::styled(
+                format!(" ✗{} ", error_count),
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if warning_count > 0 {
+            spans.push(Span::styled(
+                format!(" ⚠{} ", warning_count),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if error_count == 0 && warning_count == 0 {
+            spans.push(Span::styled(
+                " ✓ ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.push(Span::raw(" "));
+    }
+
+    spans.push(Span::raw("| "));
+    spans.push(Span::raw(app.status.clone()));
+
+    let status = Line::from(spans);
+    let paragraph =
+        Paragraph::new(status).style(Style::default().bg(Color::White).fg(Color::Black));
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_hover(frame: &mut Frame, area: Rect, app: &App) {
+    let contents = app.hover.as_deref().unwrap_or("No hover information.");
+    let hover = Paragraph::new(contents)
+        .block(
+            Block::default()
+                .title(" Hover ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: false });
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(hover, area);
+}
+
+fn draw_palette(frame: &mut Frame, area: Rect, app: &App) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(area);
+
+    let input = Paragraph::new(app.palette.input.clone())
+        .block(
+            Block::default()
+                .title(" File Search ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .alignment(Alignment::Left);
+
+    let items: Vec<ListItem> = if app.palette.results.is_empty() {
+        vec![ListItem::new("No matches")]
+    } else {
+        app.palette
+            .results
+            .iter()
+            .map(|result| ListItem::new(result.clone()))
+            .collect()
+    };
+
+    let results = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(" Results "))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("› ");
+
+    let mut state = ListState::default();
+    if !app.palette.results.is_empty() {
+        state.select(Some(app.palette.selected));
+    }
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(input, sections[0]);
+    frame.render_stateful_widget(results, sections[1], &mut state);
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
 fn token_style(kind: &str) -> Style {
     match kind {
         "comment" => Style::default().fg(Color::DarkGray),
@@ -222,146 +540,44 @@ fn highlighted_spans(
     spans
 }
 
-fn draw_terminal(frame: &mut Frame, area: Rect, app: &App) {
-    let inner_height = area.height.saturating_sub(2) as usize;
-    let lines = app.terminal.visible_lines(inner_height);
-
-    let mut text: Vec<Line> = if lines.is_empty() {
-        vec![Line::from("No output yet.")]
-    } else {
-        lines.into_iter().map(Line::from).collect()
-    };
-
-    for diag in app.diagnostic_lines() {
-        text.push(Line::from(format!("⚠ {}", diag)));
-    }
-
-    let block = Block::default()
-        .title(" Terminal ")
-        .borders(Borders::ALL)
-        .border_style(if app.focus == FocusPane::Terminal {
-            Style::default().fg(Color::Yellow)
-        } else {
+/// Returns a short fixed-width badge string and its style for a diagnostic severity.
+fn severity_badge(severity: Option<DiagnosticSeverity>) -> (&'static str, Style) {
+    match severity {
+        Some(DiagnosticSeverity::ERROR) => (
+            " ERR ",
             Style::default()
-        });
-
-    let paragraph = Paragraph::new(text).block(block);
-    frame.render_widget(paragraph, area);
-}
-
-fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
-    let focus = match app.focus {
-        FocusPane::FileTree => "FILES",
-        FocusPane::Editor => "EDITOR",
-        FocusPane::Palette => "PALETTE",
-        FocusPane::Terminal => "TERMINAL",
-    };
-
-    let root = app
-        .root_dir
-        .file_name()
-        .map(|s: &std::ffi::OsStr| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| ".".to_string());
-
-    let buf = app.editor.current_buffer();
-
-    let file = buf
-        .file_path
-        .as_ref()
-        .map(|p: &std::path::PathBuf| {
-            p.strip_prefix(&app.root_dir)
-                .ok()
-                .map(|rel: &std::path::Path| rel.display().to_string())
-                .unwrap_or_else(|| p.display().to_string())
-        })
-        .unwrap_or_else(|| "[no file]".to_string());
-
-    let position = format!("Ln {}, Col {}", buf.cursor_row + 1, buf.cursor_col + 1);
-    let dirty = if buf.dirty { "MOD" } else { "OK" };
-
-    let status = Line::from(vec![
-        Span::styled(
-            format!(" {} ", focus),
-            Style::default()
-                .bg(Color::Black)
-                .fg(Color::Yellow)
+                .fg(Color::White)
+                .bg(Color::Red)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" "),
-        Span::styled(
-            format!("root:{} ", root),
-            Style::default().add_modifier(Modifier::BOLD),
+        Some(DiagnosticSeverity::WARNING) => (
+            " WRN ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("| "),
-        Span::raw(format!("file:{} ", file)),
-        Span::raw("| "),
-        Span::styled(position, Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" | "),
-        Span::styled(
-            format!(" {} ", dirty),
-            if buf.dirty {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
-            },
+        Some(DiagnosticSeverity::INFORMATION) => (
+            " INF ",
+            Style::default().fg(Color::Black).bg(Color::Cyan),
         ),
-        Span::raw(" | "),
-        Span::raw(app.status.clone()),
-    ]);
-
-    let paragraph =
-        Paragraph::new(status).style(Style::default().bg(Color::White).fg(Color::Black));
-    frame.render_widget(paragraph, area);
+        Some(DiagnosticSeverity::HINT) => (
+            " HNT ",
+            Style::default().fg(Color::Black).bg(Color::DarkGray),
+        ),
+        _ => ("     ", Style::default()),
+    }
 }
 
-fn draw_palette(frame: &mut Frame, area: Rect, app: &App) {
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
-        .split(area);
-
-    let input = Paragraph::new(app.palette.input.clone())
-        .block(
-            Block::default()
-                .title(" File Search ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
-        )
-        .alignment(Alignment::Left);
-
-    let items: Vec<ListItem> = if app.palette.results.is_empty() {
-        vec![ListItem::new("No matches")]
+/// Truncate to `max_chars` characters, appending `…` if the string was cut.
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
     } else {
-        app.palette
-            .results
-            .iter()
-            .map(|result| ListItem::new(result.clone()))
-            .collect()
-    };
-
-    let results = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Results "))
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("› ");
-
-    let mut state = ListState::default();
-    if !app.palette.results.is_empty() {
-        state.select(Some(app.palette.selected));
+        head
     }
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(input, sections[0]);
-    frame.render_stateful_widget(results, sections[1], &mut state);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

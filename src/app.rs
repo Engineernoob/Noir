@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -6,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{
     editor::Editor,
     file_tree::FileTree,
-    lsp::{LspClient, LspDiagnostic, LspEvent, LspLocation},
+    lsp::{DiagnosticSeverity, LspClient, LspDiagnostic, LspEvent},
     palette::CommandPalette,
     terminal::TerminalPane,
 };
@@ -17,12 +20,23 @@ pub enum FocusPane {
     Editor,
     Palette,
     Terminal,
+    Diagnostics,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     None,
     Quit,
+}
+
+/// A single flattened diagnostic entry used by the diagnostics pane.
+#[derive(Debug, Clone)]
+pub struct DiagnosticEntry {
+    pub path: PathBuf,
+    pub line: u32,
+    pub character: u32,
+    pub severity: Option<DiagnosticSeverity>,
+    pub message: String,
 }
 
 pub struct App {
@@ -32,7 +46,15 @@ pub struct App {
     pub palette: CommandPalette,
     pub terminal: TerminalPane,
     pub lsp: Option<LspClient>,
-    pub diagnostics: Vec<LspDiagnostic>,
+    pub diagnostics: HashMap<PathBuf, Vec<LspDiagnostic>>,
+    pub hover: Option<String>,
+    pub hover_visible: bool,
+    /// Whether the diagnostics pane is shown in the bottom slot.
+    pub diagnostics_open: bool,
+    /// Currently highlighted row in the diagnostics list.
+    pub diagnostics_selected: usize,
+    /// Flattened, sorted list rebuilt whenever `self.diagnostics` changes.
+    pub diagnostics_entries: Vec<DiagnosticEntry>,
     pub focus: FocusPane,
     pub should_quit: bool,
     pub status: String,
@@ -47,8 +69,14 @@ impl App {
         let mut editor = Editor::default();
         let mut terminal = TerminalPane::new();
 
-        if let Some(first_file) = file_tree.selected_path() {
-            editor.open_file(first_file)?;
+        // selected_path() is None when the first visible entry is a directory,
+        // which is the common case now that dirs are sorted before files.
+        let initial_file = file_tree
+            .selected_path()
+            .or_else(|| file_tree.first_file_path())
+            .cloned();
+        if let Some(path) = initial_file {
+            editor.open_file(&path)?;
         }
 
         terminal.init_shell()?;
@@ -65,7 +93,12 @@ impl App {
             palette: CommandPalette::default(),
             terminal,
             lsp,
-            diagnostics: Vec::new(),
+            diagnostics: HashMap::new(),
+            hover: None,
+            hover_visible: false,
+            diagnostics_open: false,
+            diagnostics_selected: 0,
+            diagnostics_entries: Vec::new(),
             focus: FocusPane::FileTree,
             should_quit: false,
             status: format!("Noir ready — {}", root_dir.display()),
@@ -73,8 +106,7 @@ impl App {
             editor_view_width: 1,
         };
 
-        let _ = app.sync_current_buffer_with_lsp();
-
+        let _ = app.sync_current_buffer_open();
         Ok(app)
     }
 
@@ -127,11 +159,18 @@ impl App {
                     }
                     return Ok(Action::None);
                 }
+                KeyCode::Char('4') => {
+                    if self.diagnostics_open {
+                        self.focus = FocusPane::Diagnostics;
+                        self.status = "Focus: diagnostics".to_string();
+                    }
+                    return Ok(Action::None);
+                }
                 KeyCode::Char('.') => {
                     self.editor.next_tab();
                     self.editor
                         .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
-                    let _ = self.sync_current_buffer_with_lsp();
+                    let _ = self.sync_current_buffer_open();
                     self.status = format!("Tab: {}", self.editor.title());
                     return Ok(Action::None);
                 }
@@ -139,7 +178,7 @@ impl App {
                     self.editor.prev_tab();
                     self.editor
                         .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
-                    let _ = self.sync_current_buffer_with_lsp();
+                    let _ = self.sync_current_buffer_open();
                     self.status = format!("Tab: {}", self.editor.title());
                     return Ok(Action::None);
                 }
@@ -168,6 +207,14 @@ impl App {
                     self.status = "Focus: editor".to_string();
                     return Ok(Action::None);
                 }
+                KeyCode::Char('k') => {
+                    self.request_hover()?;
+                    return Ok(Action::None);
+                }
+                KeyCode::Char('g') => {
+                    self.request_definition()?;
+                    return Ok(Action::None);
+                }
                 KeyCode::Char('p') => {
                     self.palette.toggle();
 
@@ -181,14 +228,6 @@ impl App {
                         self.status = "Closed file search".to_string();
                     }
 
-                    return Ok(Action::None);
-                }
-                KeyCode::Char('k') => {
-                    self.request_hover()?;
-                    return Ok(Action::None);
-                }
-                KeyCode::Char('g') => {
-                    self.request_definition()?;
                     return Ok(Action::None);
                 }
                 KeyCode::Char('t') => {
@@ -205,8 +244,17 @@ impl App {
 
                     return Ok(Action::None);
                 }
+                KeyCode::Char('d') => {
+                    self.toggle_diagnostics();
+                    return Ok(Action::None);
+                }
                 _ => {}
             }
+        }
+
+        if key.code == KeyCode::F(12) {
+            self.request_definition()?;
+            return Ok(Action::None);
         }
 
         match self.focus {
@@ -214,6 +262,7 @@ impl App {
             FocusPane::Editor => self.handle_editor_key(key),
             FocusPane::Palette => self.handle_palette_key(key),
             FocusPane::Terminal => self.handle_terminal_key(key),
+            FocusPane::Diagnostics => self.handle_diagnostics_key(key),
         }
     }
 
@@ -221,14 +270,20 @@ impl App {
         match key.code {
             KeyCode::Up => self.file_tree.move_up(),
             KeyCode::Down => self.file_tree.move_down(),
+            // Right: expand a collapsed dir; no-op otherwise.
+            KeyCode::Right => self.file_tree.expand_selected(),
+            // Left: collapse an expanded dir, or jump to parent dir.
+            KeyCode::Left => self.file_tree.collapse_selected(),
             KeyCode::Enter => {
-                if let Some(path) = self.file_tree.selected_path() {
+                if self.file_tree.selected_is_dir() {
+                    self.file_tree.toggle_expand();
+                } else if let Some(path) = self.file_tree.selected_path() {
                     let path = path.clone();
 
                     self.editor.open_file(&path)?;
                     self.editor
                         .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
-                    let _ = self.sync_current_buffer_with_lsp();
+                    let _ = self.sync_current_buffer_open();
 
                     self.focus = FocusPane::Editor;
                     self.status = format!("Opened {}", path.display());
@@ -246,6 +301,12 @@ impl App {
 
     fn handle_editor_key(&mut self, key: KeyEvent) -> Result<Action> {
         match key.code {
+            KeyCode::Esc => {
+                if self.hover_visible {
+                    self.hover_visible = false;
+                    self.status = "Closed hover".to_string();
+                }
+            }
             KeyCode::Tab => {
                 if self.terminal.visible {
                     self.focus = FocusPane::Terminal;
@@ -293,7 +354,7 @@ impl App {
                         self.editor.open_file(&path)?;
                         self.editor
                             .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
-                        let _ = self.sync_current_buffer_with_lsp();
+                        let _ = self.sync_current_buffer_open();
 
                         self.status = format!("Opened {}", selected);
                     }
@@ -340,50 +401,177 @@ impl App {
         Ok(Action::None)
     }
 
-    pub fn diagnostic_lines(&self) -> Vec<String> {
-        let current_path = self.editor.current_buffer().file_path.as_ref();
+    fn handle_diagnostics_key(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Up => {
+                if self.diagnostics_selected > 0 {
+                    self.diagnostics_selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if !self.diagnostics_entries.is_empty()
+                    && self.diagnostics_selected + 1 < self.diagnostics_entries.len()
+                {
+                    self.diagnostics_selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                self.jump_to_diagnostic();
+            }
+            KeyCode::Esc => {
+                self.diagnostics_open = false;
+                self.focus = FocusPane::Editor;
+                self.status = "Closed diagnostics".to_string();
+            }
+            KeyCode::Tab => {
+                self.focus = FocusPane::Editor;
+                self.status = "Focus: editor".to_string();
+            }
+            _ => {}
+        }
 
-        self.diagnostics
-            .iter()
-            .filter(|diagnostic| current_path == Some(&diagnostic.path))
-            .map(LspDiagnostic::summary)
-            .collect()
+        Ok(Action::None)
     }
 
     fn apply_lsp_event(&mut self, event: LspEvent) {
         match event {
-            LspEvent::Diagnostics { uri, diagnostics } => {
-                self.diagnostics.retain(|existing| existing.uri != uri);
-                self.diagnostics.extend(diagnostics);
+            LspEvent::Initialized => self.status = "rust-analyzer ready".to_string(),
+            LspEvent::Shutdown => self.status = "rust-analyzer shutdown".to_string(),
+            LspEvent::Diagnostics { path, diagnostics } => {
+                if diagnostics.is_empty() {
+                    self.diagnostics.remove(&path);
+                } else {
+                    self.diagnostics.insert(path, diagnostics);
+                }
+                self.rebuild_diagnostic_entries();
+                let errors = self.diagnostic_error_count();
+                let warnings = self.diagnostic_warning_count();
+                self.status = format!("Diagnostics: {errors} error(s), {warnings} warning(s)");
             }
             LspEvent::Hover { contents } => {
-                self.status = match contents {
-                    Some(contents) => format!("Hover: {}", truncate(&contents, 120)),
-                    None => "Hover: no information".to_string(),
+                self.hover = contents;
+                self.hover_visible = self.hover.is_some();
+                self.status = if self.hover_visible {
+                    "Hover loaded".to_string()
+                } else {
+                    "No hover information".to_string()
                 };
             }
             LspEvent::Definition { location } => {
-                if let Some(location) = location {
-                    if let Err(err) = self.open_definition(location) {
-                        self.status = format!("Definition failed: {err}");
-                    }
-                } else {
-                    self.status = "Definition: no result".to_string();
-                }
+                self.apply_definition(location);
             }
-            LspEvent::Status(message) => {
-                self.status = message;
-            }
+            LspEvent::LogMessage(message) => self.status = format!("LSP: {message}"),
+            LspEvent::TransportError(error) => self.status = format!("LSP error: {error}"),
+            LspEvent::ServerExited => self.status = "rust-analyzer exited".to_string(),
         }
     }
 
-    fn sync_current_buffer_with_lsp(&mut self) -> Result<()> {
+    /// Flatten `self.diagnostics` into `self.diagnostics_entries`, sorted errors-first.
+    fn rebuild_diagnostic_entries(&mut self) {
+        let mut entries: Vec<DiagnosticEntry> = Vec::new();
+        let mut paths: Vec<PathBuf> = self.diagnostics.keys().cloned().collect();
+        paths.sort();
+
+        for path in &paths {
+            if let Some(diags) = self.diagnostics.get(path) {
+                for d in diags {
+                    entries.push(DiagnosticEntry {
+                        path: path.clone(),
+                        line: d.line,
+                        character: d.character,
+                        severity: d.severity,
+                        message: d.message.clone(),
+                    });
+                }
+            }
+        }
+
+        // Errors → warnings → info → hints, then by file + line within each bucket.
+        entries.sort_by(|a, b| {
+            severity_sort_key(a.severity)
+                .cmp(&severity_sort_key(b.severity))
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.line.cmp(&b.line))
+        });
+
+        self.diagnostics_entries = entries;
+
+        // Keep selection in bounds.
+        if self.diagnostics_entries.is_empty() {
+            self.diagnostics_selected = 0;
+        } else if self.diagnostics_selected >= self.diagnostics_entries.len() {
+            self.diagnostics_selected = self.diagnostics_entries.len() - 1;
+        }
+    }
+
+    fn toggle_diagnostics(&mut self) {
+        self.diagnostics_open = !self.diagnostics_open;
+        if self.diagnostics_open {
+            self.focus = FocusPane::Diagnostics;
+            let n = self.diagnostics_entries.len();
+            self.status = if n == 0 {
+                "Diagnostics — no issues  [Esc] close".to_string()
+            } else {
+                format!("Diagnostics — {n} issue(s)  [↑↓] navigate  [Enter] jump  [Esc] close")
+            };
+        } else {
+            if self.focus == FocusPane::Diagnostics {
+                self.focus = FocusPane::Editor;
+            }
+            self.status = "Closed diagnostics".to_string();
+        }
+    }
+
+    fn jump_to_diagnostic(&mut self) {
+        if self.diagnostics_entries.is_empty() {
+            return;
+        }
+
+        let entry = &self.diagnostics_entries[self.diagnostics_selected];
+        let path = entry.path.clone();
+        let line = entry.line;
+        let character = entry.character;
+
+        if let Err(e) = self.editor.open_file(&path) {
+            self.status = format!("Cannot open {}: {e}", path.display());
+            return;
+        }
+
+        {
+            let buf = self.editor.current_buffer_mut();
+            buf.cursor_row = line as usize;
+            buf.cursor_col = character as usize;
+        }
+
+        self.editor
+            .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
+        let _ = self.sync_current_buffer_open();
+
+        self.focus = FocusPane::Editor;
+        self.status = format!("Jumped to {}:{}", path.display(), line + 1);
+    }
+
+    pub fn diagnostic_error_count(&self) -> usize {
+        self.diagnostics_entries
+            .iter()
+            .filter(|e| e.severity == Some(DiagnosticSeverity::ERROR))
+            .count()
+    }
+
+    pub fn diagnostic_warning_count(&self) -> usize {
+        self.diagnostics_entries
+            .iter()
+            .filter(|e| e.severity == Some(DiagnosticSeverity::WARNING))
+            .count()
+    }
+
+    fn sync_current_buffer_open(&mut self) -> Result<()> {
         let Some((path, text, version)) = self.current_document_snapshot() else {
             return Ok(());
         };
 
         if let Some(lsp) = &mut self.lsp {
-            lsp.open_document(&path, &text, version)?;
+            lsp.open_document(&path, text, version)?;
         }
 
         Ok(())
@@ -395,23 +583,28 @@ impl App {
         };
 
         if let Some(lsp) = &mut self.lsp {
-            lsp.change_document(&path, &text, version)?;
+            lsp.change_document(&path, text, version)?;
         }
 
         Ok(())
     }
 
+    fn current_document_snapshot(&self) -> Option<(PathBuf, String, i32)> {
+        let buffer = self.editor.current_buffer();
+        let path = buffer.file_path.clone()?;
+        Some((path, self.editor.current_buffer_text(), buffer.version))
+    }
+
     fn request_hover(&mut self) -> Result<()> {
-        let Some((path, text, version)) = self.current_document_snapshot() else {
-            self.status = "Hover: no file open".to_string();
+        let Some((path, _, _)) = self.current_document_snapshot() else {
+            self.status = "Hover unavailable: no file open".to_string();
             return Ok(());
         };
 
         let (line, character) = self.editor.current_lsp_position();
 
         if let Some(lsp) = &mut self.lsp {
-            lsp.open_document(&path, &text, version)?;
-            lsp.request_hover(&path, line, character)?;
+            lsp.hover(&path, line, character)?;
             self.status = "Hover requested".to_string();
         } else {
             self.status = "LSP unavailable".to_string();
@@ -421,17 +614,16 @@ impl App {
     }
 
     fn request_definition(&mut self) -> Result<()> {
-        let Some((path, text, version)) = self.current_document_snapshot() else {
-            self.status = "Definition: no file open".to_string();
+        let Some((path, _, _)) = self.current_document_snapshot() else {
+            self.status = "Go to definition: no file open".to_string();
             return Ok(());
         };
 
         let (line, character) = self.editor.current_lsp_position();
 
         if let Some(lsp) = &mut self.lsp {
-            lsp.open_document(&path, &text, version)?;
-            lsp.request_definition(&path, line, character)?;
-            self.status = "Definition requested".to_string();
+            lsp.definition(&path, line, character)?;
+            self.status = "Go to definition requested".to_string();
         } else {
             self.status = "LSP unavailable".to_string();
         }
@@ -439,35 +631,45 @@ impl App {
         Ok(())
     }
 
-    fn open_definition(&mut self, location: LspLocation) -> Result<()> {
-        self.editor.open_file(&location.path)?;
-        self.editor
-            .set_cursor_from_lsp(location.line as usize, location.character as usize);
+    fn apply_definition(&mut self, location: Option<(PathBuf, u32, u32)>) {
+        let Some((path, line, character)) = location else {
+            self.status = "No definition found".to_string();
+            return;
+        };
+
+        if let Err(e) = self.editor.open_file(&path) {
+            self.status = format!("Definition: failed to open {}: {e}", path.display());
+            return;
+        }
+
+        {
+            let buf = self.editor.current_buffer_mut();
+            buf.cursor_row = line as usize;
+            buf.cursor_col = character as usize;
+        }
+
         self.editor
             .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
-        self.sync_current_buffer_with_lsp()?;
+        let _ = self.sync_current_buffer_open();
+
         self.focus = FocusPane::Editor;
-        self.status = format!(
-            "Definition: {}:{}",
-            location.path.display(),
-            location.line + 1
-        );
-        Ok(())
+        self.status = format!("Definition: {}:{}", path.display(), line + 1);
     }
 
-    fn current_document_snapshot(&self) -> Option<(PathBuf, String, i32)> {
-        let buffer = self.editor.current_buffer();
-        let path = buffer.file_path.clone()?;
-        Some((path, self.editor.current_buffer_text(), buffer.version))
+    pub fn shutdown(&mut self) {
+        if let Some(lsp) = &mut self.lsp {
+            let _ = lsp.shutdown();
+            let _ = lsp.exit();
+        }
     }
 }
 
-fn truncate(text: &str, max_len: usize) -> String {
-    let mut truncated = text.chars().take(max_len).collect::<String>();
-
-    if text.chars().count() > max_len {
-        truncated.push_str("...");
+fn severity_sort_key(severity: Option<DiagnosticSeverity>) -> u8 {
+    match severity {
+        Some(DiagnosticSeverity::ERROR) => 0,
+        Some(DiagnosticSeverity::WARNING) => 1,
+        Some(DiagnosticSeverity::INFORMATION) => 2,
+        Some(DiagnosticSeverity::HINT) => 3,
+        _ => 4,
     }
-
-    truncated
 }

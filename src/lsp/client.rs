@@ -1,517 +1,420 @@
 use std::{
     collections::{HashMap, HashSet},
-    io::BufReader,
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
-    sync::mpsc::{self, Receiver},
-    thread,
 };
 
 use anyhow::{Result, anyhow};
-use lsp_types::Url;
-use serde_json::{Value, json};
+use lsp_types::{
+    DiagnosticSeverity, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+    GotoDefinitionResponse, Hover, HoverContents, InitializedParams, Location, MarkedString,
+    Position, PublishDiagnosticsParams, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
+    WorkspaceFolder,
+    notification::{
+        DidChangeTextDocument, DidOpenTextDocument, Exit, Initialized, LogMessage, Notification,
+        PublishDiagnostics, ShowMessage,
+    },
+    request::{GotoDefinition, HoverRequest, Initialize, Request, Shutdown},
+};
+use serde_json::{Value, json, to_value};
 
-use crate::lsp::transport;
-
-#[derive(Debug, Clone)]
-pub struct LspDiagnostic {
-    pub uri: String,
-    pub path: PathBuf,
-    pub line: u32,
-    pub column: u32,
-    pub severity: Option<String>,
-    pub message: String,
-}
-
-impl LspDiagnostic {
-    pub fn summary(&self) -> String {
-        let location = format!(
-            "{}:{}:{}",
-            self.path.display(),
-            self.line + 1,
-            self.column + 1
-        );
-
-        match &self.severity {
-            Some(severity) => format!("[{severity}] {location} {}", self.message),
-            None => format!("{location} {}", self.message),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct LspLocation {
-    pub path: PathBuf,
-    pub line: u32,
-    pub character: u32,
-}
+use crate::lsp::{
+    protocol::{
+        IncomingMessage, NotificationMessage, RequestId, RequestMessage, ResponseMessage,
+        ServerNotification, ServerResponse,
+    },
+    transport::{StdioTransport, TransportEvent},
+};
 
 #[derive(Debug, Clone)]
 pub enum LspEvent {
+    Initialized,
+    Shutdown,
     Diagnostics {
-        uri: String,
+        path: PathBuf,
         diagnostics: Vec<LspDiagnostic>,
     },
     Hover {
         contents: Option<String>,
     },
     Definition {
-        location: Option<LspLocation>,
+        /// `None` means the server returned no result.
+        location: Option<(PathBuf, u32, u32)>,
     },
-    Status(String),
+    LogMessage(String),
+    TransportError(String),
+    ServerExited,
 }
 
+#[derive(Debug, Clone)]
+pub struct LspDiagnostic {
+    pub line: u32,
+    pub character: u32,
+    pub severity: Option<DiagnosticSeverity>,
+    pub message: String,
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientState {
+    Created,
+    Initializing,
+    Ready,
+    ShutdownRequested,
+    Exited,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum PendingRequest {
     Initialize,
+    Shutdown,
     Hover,
-    Definition,
+    GotoDefinition,
 }
 
 pub struct LspClient {
-    stdin: ChildStdin,
-    incoming: Receiver<Value>,
-    _child: Child,
+    transport: StdioTransport,
     next_request_id: u64,
-    pending_requests: HashMap<u64, PendingRequest>,
+    pending_requests: HashMap<RequestId, PendingRequest>,
     queued_messages: Vec<Value>,
-    open_documents: HashSet<String>,
-    root_uri: String,
-    ready: bool,
+    open_documents: HashSet<Url>,
+    root_uri: Url,
+    root_name: String,
+    state: ClientState,
 }
 
 impl LspClient {
     pub fn start(root: &Path) -> Result<Self> {
-        let mut child = Command::new("rust-analyzer")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("failed to capture rust-analyzer stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("failed to capture rust-analyzer stdout"))?;
-
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-
-            loop {
-                match transport::read_message(&mut reader) {
-                    Ok(Some(message)) => {
-                        if tx.send(message).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(_) => break,
-                }
-            }
-        });
+        let root_uri = Url::from_file_path(root)
+            .map_err(|_| anyhow!("failed to convert {} to file URI", root.display()))?;
+        let root_name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(".")
+            .to_string();
 
         Ok(Self {
-            stdin,
-            incoming: rx,
-            _child: child,
+            transport: StdioTransport::start("rust-analyzer")?,
             next_request_id: 1,
             pending_requests: HashMap::new(),
             queued_messages: Vec::new(),
             open_documents: HashSet::new(),
-            root_uri: path_to_uri(root)?,
-            ready: false,
+            root_uri,
+            root_name,
+            state: ClientState::Created,
         })
     }
 
     pub fn initialize(&mut self) -> Result<()> {
-        let request_id = self.next_id();
-        self.pending_requests
-            .insert(request_id, PendingRequest::Initialize);
+        if self.state != ClientState::Created {
+            return Ok(());
+        }
 
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": "initialize",
-            "params": {
-                "processId": std::process::id(),
-                "rootUri": self.root_uri,
-                "workspaceFolders": [{
-                    "uri": self.root_uri,
-                    "name": "Noir",
-                }],
-                "clientInfo": {
-                    "name": "Noir",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-                "capabilities": {
-                    "general": {
-                        "positionEncodings": ["utf-8"],
-                    },
-                    "textDocument": {
-                        "hover": {
-                            "contentFormat": ["markdown", "plaintext"],
-                        },
-                        "definition": {
-                            "linkSupport": true,
-                        },
-                        "publishDiagnostics": {},
-                        "synchronization": {
-                            "didSave": false,
-                            "dynamicRegistration": false,
-                            "willSave": false,
-                            "willSaveWaitUntil": false,
-                        },
-                    },
-                    "workspace": {
-                        "workspaceFolders": true,
-                    },
-                },
-            }
-        }))
+        let workspace_folder = WorkspaceFolder {
+            uri: self.root_uri.clone(),
+            name: self.root_name.clone(),
+        };
+
+        let request_id = self.allocate_request(PendingRequest::Initialize);
+        let params = json!({
+            "processId": std::process::id(),
+            "rootUri": self.root_uri,
+            "workspaceFolders": [workspace_folder],
+            "clientInfo": {
+                "name": "Noir",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "capabilities": {
+                "textDocument": {
+                    "publishDiagnostics": {},
+                    "synchronization": {
+                        "didSave": true,
+                        "dynamicRegistration": false,
+                        "willSave": false,
+                        "willSaveWaitUntil": false
+                    }
+                }
+            },
+        });
+
+        self.transport
+            .send(&RequestMessage::new(request_id, Initialize::METHOD, params))?;
+        self.state = ClientState::Initializing;
+        Ok(())
     }
 
-    pub fn open_document(&mut self, path: &Path, text: &str, version: i32) -> Result<()> {
+    pub fn open_document(&mut self, path: &Path, text: String, version: i32) -> Result<()> {
         let uri = path_to_uri(path)?;
-
         if self.open_documents.contains(&uri) {
             return Ok(());
         }
 
-        self.open_documents.insert(uri.clone());
+        let params = DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: language_id(path).to_string(),
+                version,
+                text,
+            },
+        };
 
-        self.send_or_queue(json!({
-            "jsonrpc": "2.0",
-            "method": "textDocument/didOpen",
-            "params": {
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": language_id(path),
-                    "version": version,
-                    "text": text,
-                }
-            }
-        }))
+        self.open_documents.insert(uri);
+        self.send_notification_or_queue(DidOpenTextDocument::METHOD, params)
     }
 
-    pub fn change_document(&mut self, path: &Path, text: &str, version: i32) -> Result<()> {
+    pub fn change_document(&mut self, path: &Path, text: String, version: i32) -> Result<()> {
         let uri = path_to_uri(path)?;
 
         if !self.open_documents.contains(&uri) {
             return self.open_document(path, text, version);
         }
 
-        self.send_or_queue(json!({
-            "jsonrpc": "2.0",
-            "method": "textDocument/didChange",
-            "params": {
-                "textDocument": {
-                    "uri": uri,
-                    "version": version,
-                },
-                "contentChanges": [{
-                    "text": text,
-                }]
-            }
-        }))
+        let params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier { uri, version },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text,
+            }],
+        };
+
+        self.send_notification_or_queue(DidChangeTextDocument::METHOD, params)
     }
 
-    pub fn request_hover(&mut self, path: &Path, line: u32, character: u32) -> Result<()> {
-        let uri = path_to_uri(path)?;
-        let request_id = self.next_id();
-        self.pending_requests
-            .insert(request_id, PendingRequest::Hover);
+    pub fn shutdown(&mut self) -> Result<()> {
+        if !matches!(self.state, ClientState::Ready)
+            || matches!(
+                self.state,
+                ClientState::ShutdownRequested | ClientState::Exited
+            )
+        {
+            return Ok(());
+        }
 
-        self.send_or_queue(json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": "textDocument/hover",
-            "params": {
-                "textDocument": {
-                    "uri": uri,
-                },
-                "position": {
-                    "line": line,
-                    "character": character,
-                }
-            }
-        }))
+        let request_id = self.allocate_request(PendingRequest::Shutdown);
+        self.transport
+            .send(&RequestMessage::new(request_id, Shutdown::METHOD, ()))?;
+        self.state = ClientState::ShutdownRequested;
+        Ok(())
     }
 
-    pub fn request_definition(&mut self, path: &Path, line: u32, character: u32) -> Result<()> {
+    pub fn hover(&mut self, path: &Path, line: u32, character: u32) -> Result<()> {
         let uri = path_to_uri(path)?;
-        let request_id = self.next_id();
-        self.pending_requests
-            .insert(request_id, PendingRequest::Definition);
+        let params = TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position: Position { line, character },
+        };
 
-        self.send_or_queue(json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": "textDocument/definition",
-            "params": {
-                "textDocument": {
-                    "uri": uri,
-                },
-                "position": {
-                    "line": line,
-                    "character": character,
-                }
-            }
-        }))
+        let request_id = self.allocate_request(PendingRequest::Hover);
+        self.send_request_or_queue(HoverRequest::METHOD, request_id, params)
+    }
+
+    pub fn definition(&mut self, path: &Path, line: u32, character: u32) -> Result<()> {
+        let uri = path_to_uri(path)?;
+        let params = TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position: Position { line, character },
+        };
+
+        let request_id = self.allocate_request(PendingRequest::GotoDefinition);
+        self.send_request_or_queue(GotoDefinition::METHOD, request_id, params)
+    }
+
+    pub fn exit(&mut self) -> Result<()> {
+        if self.state == ClientState::Exited {
+            return Ok(());
+        }
+
+        self.transport
+            .send(&NotificationMessage::new(Exit::METHOD, ()))?;
+        self.state = ClientState::Exited;
+        Ok(())
     }
 
     pub fn drain_events(&mut self) -> Vec<LspEvent> {
         let mut events = Vec::new();
 
-        while let Ok(message) = self.incoming.try_recv() {
-            self.handle_message(message, &mut events);
+        while let Some(event) = self.transport.try_recv() {
+            match event {
+                TransportEvent::Message(message) => self.handle_message(message, &mut events),
+                TransportEvent::ReadError(error) => events.push(LspEvent::TransportError(error)),
+                TransportEvent::Closed => events.push(LspEvent::ServerExited),
+            }
         }
 
         events
     }
 
-    fn handle_message(&mut self, message: Value, events: &mut Vec<LspEvent>) {
-        if let Some(method) = message.get("method").and_then(Value::as_str) {
-            if let Some(id) = message.get("id") {
-                let _ = self.send(&json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": Value::Null,
-                }));
-                return;
-            }
-
-            match method {
-                "textDocument/publishDiagnostics" => {
-                    if let Some((uri, diagnostics)) =
-                        parse_publish_diagnostics(message.get("params").unwrap_or(&Value::Null))
-                    {
-                        events.push(LspEvent::Diagnostics { uri, diagnostics });
-                    }
+    fn handle_message(&mut self, message: IncomingMessage, events: &mut Vec<LspEvent>) {
+        match message {
+            IncomingMessage::Request(request) => {
+                if let Err(err) = self
+                    .transport
+                    .send(&ResponseMessage::success(request.id, Value::Null))
+                {
+                    events.push(LspEvent::TransportError(err.to_string()));
                 }
-                "window/logMessage" | "window/showMessage" => {
-                    if let Some(text) = message
-                        .get("params")
-                        .and_then(|params| params.get("message"))
-                        .and_then(Value::as_str)
-                    {
-                        events.push(LspEvent::Status(text.trim().to_string()));
-                    }
-                }
-                _ => {}
             }
-
-            return;
+            IncomingMessage::Notification(notification) => {
+                self.handle_notification(notification, events);
+            }
+            IncomingMessage::Response(response) => {
+                self.handle_response(response, events);
+            }
         }
+    }
 
-        let Some(request_id) = parse_request_id(message.get("id")) else {
+    fn handle_notification(
+        &mut self,
+        notification: ServerNotification,
+        events: &mut Vec<LspEvent>,
+    ) {
+        if notification.method == PublishDiagnostics::METHOD {
+            if let Some(params) = notification.params {
+                match serde_json::from_value::<PublishDiagnosticsParams>(params) {
+                    Ok(params) => {
+                        if let Ok(path) = params.uri.to_file_path() {
+                            let diagnostics = params
+                                .diagnostics
+                                .into_iter()
+                                .map(|diagnostic| LspDiagnostic {
+                                    line: diagnostic.range.start.line,
+                                    character: diagnostic.range.start.character,
+                                    severity: diagnostic.severity,
+                                    message: diagnostic.message,
+                                })
+                                .collect();
+
+                            events.push(LspEvent::Diagnostics { path, diagnostics });
+                        }
+                    }
+                    Err(err) => events.push(LspEvent::TransportError(err.to_string())),
+                }
+            }
+        } else if notification.method == LogMessage::METHOD {
+            if let Some(params) = notification.params {
+                match serde_json::from_value::<lsp_types::LogMessageParams>(params) {
+                    Ok(params) => events.push(LspEvent::LogMessage(params.message)),
+                    Err(err) => events.push(LspEvent::TransportError(err.to_string())),
+                }
+            }
+        } else if notification.method == ShowMessage::METHOD {
+            if let Some(params) = notification.params {
+                match serde_json::from_value::<lsp_types::ShowMessageParams>(params) {
+                    Ok(params) => events.push(LspEvent::LogMessage(params.message)),
+                    Err(err) => events.push(LspEvent::TransportError(err.to_string())),
+                }
+            }
+        }
+    }
+
+    fn handle_response(&mut self, response: ServerResponse, events: &mut Vec<LspEvent>) {
+        let Some(pending_request) = self.pending_requests.remove(&response.id) else {
             return;
         };
 
-        let Some(pending_request) = self.pending_requests.remove(&request_id) else {
-            return;
-        };
-
-        if let Some(error) = message.get("error") {
-            events.push(LspEvent::Status(format!("LSP error: {error}")));
+        if let Some(error) = response.error {
+            let details = match error.data {
+                Some(data) => format!("{} (code {}, data: {data})", error.message, error.code),
+                None => format!("{} (code {})", error.message, error.code),
+            };
+            events.push(LspEvent::TransportError(details));
             return;
         }
 
         match pending_request {
             PendingRequest::Initialize => {
-                self.ready = true;
-                let _ = self.send(&json!({
-                    "jsonrpc": "2.0",
-                    "method": "initialized",
-                    "params": {},
-                }));
-
-                for queued in std::mem::take(&mut self.queued_messages) {
-                    let _ = self.send(&queued);
+                if let Err(err) = self.transport.send(&NotificationMessage::new(
+                    Initialized::METHOD,
+                    InitializedParams {},
+                )) {
+                    events.push(LspEvent::TransportError(err.to_string()));
+                    return;
                 }
 
-                events.push(LspEvent::Status("rust-analyzer ready".to_string()));
+                for message in std::mem::take(&mut self.queued_messages) {
+                    if let Err(err) = self.transport.send(&message) {
+                        events.push(LspEvent::TransportError(err.to_string()));
+                        return;
+                    }
+                }
+
+                self.state = ClientState::Ready;
+                events.push(LspEvent::Initialized);
+            }
+            PendingRequest::Shutdown => {
+                let _ = response.result;
+                self.state = ClientState::Created;
+                events.push(LspEvent::Shutdown);
             }
             PendingRequest::Hover => {
-                events.push(LspEvent::Hover {
-                    contents: parse_hover(message.get("result")),
-                });
+                let contents = response
+                    .result
+                    .and_then(|value| serde_json::from_value::<Option<Hover>>(value).ok())
+                    .flatten()
+                    .map(|hover| render_hover_contents(hover.contents));
+
+                events.push(LspEvent::Hover { contents });
             }
-            PendingRequest::Definition => {
-                events.push(LspEvent::Definition {
-                    location: parse_definition(message.get("result")),
+            PendingRequest::GotoDefinition => {
+                let location = response.result.and_then(|value| {
+                    serde_json::from_value::<Option<GotoDefinitionResponse>>(value)
+                        .ok()
+                        .flatten()
+                        .and_then(first_definition_location)
                 });
+
+                events.push(LspEvent::Definition { location });
             }
         }
     }
 
-    fn send_or_queue(&mut self, value: Value) -> Result<()> {
-        if self.ready {
-            self.send(&value)
+    fn allocate_request(&mut self, pending: PendingRequest) -> RequestId {
+        let id = RequestId::new(self.next_request_id);
+        self.next_request_id += 1;
+        self.pending_requests.insert(id, pending);
+        id
+    }
+
+    fn send_notification_or_queue<P>(&mut self, method: &'static str, params: P) -> Result<()>
+    where
+        P: serde::Serialize,
+    {
+        let message = to_value(NotificationMessage::new(method, params))?;
+
+        if self.state == ClientState::Ready {
+            self.transport.send(&message)?;
         } else {
-            self.queued_messages.push(value);
-            Ok(())
+            self.queued_messages.push(message);
         }
-    }
 
-    fn send(&mut self, value: &Value) -> Result<()> {
-        transport::write_message(&mut self.stdin, value)?;
         Ok(())
     }
 
-    fn next_id(&mut self) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        id
-    }
-}
+    fn send_request_or_queue<P>(
+        &mut self,
+        method: &'static str,
+        id: RequestId,
+        params: P,
+    ) -> Result<()>
+    where
+        P: serde::Serialize,
+    {
+        let message = to_value(RequestMessage::new(id, method, params))?;
 
-fn parse_request_id(id: Option<&Value>) -> Option<u64> {
-    id.and_then(Value::as_u64)
-}
-
-fn parse_publish_diagnostics(params: &Value) -> Option<(String, Vec<LspDiagnostic>)> {
-    let uri = params.get("uri")?.as_str()?.to_string();
-    let path = uri_to_path(&uri)?;
-    let diagnostics = params
-        .get("diagnostics")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| parse_diagnostic(item, &uri, &path))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    Some((uri, diagnostics))
-}
-
-fn parse_diagnostic(item: &Value, uri: &str, path: &Path) -> Option<LspDiagnostic> {
-    let range = item.get("range")?;
-    let start = range.get("start")?;
-    let line = start.get("line")?.as_u64()? as u32;
-    let column = start.get("character")?.as_u64()? as u32;
-    let message = item.get("message")?.as_str()?.trim().to_string();
-    let severity = item
-        .get("severity")
-        .and_then(Value::as_u64)
-        .map(severity_name);
-
-    Some(LspDiagnostic {
-        uri: uri.to_string(),
-        path: path.to_path_buf(),
-        line,
-        column,
-        severity,
-        message,
-    })
-}
-
-fn severity_name(value: u64) -> String {
-    match value {
-        1 => "error".to_string(),
-        2 => "warning".to_string(),
-        3 => "info".to_string(),
-        4 => "hint".to_string(),
-        _ => format!("severity-{value}"),
-    }
-}
-
-fn parse_hover(result: Option<&Value>) -> Option<String> {
-    let contents = result?.get("contents")?;
-    let rendered = render_hover_contents(contents)?;
-
-    let compact = rendered
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    if compact.is_empty() {
-        None
-    } else {
-        Some(compact)
-    }
-}
-
-fn render_hover_contents(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => Some(text.to_string()),
-        Value::Array(items) => {
-            let rendered = items
-                .iter()
-                .filter_map(render_hover_contents)
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            if rendered.is_empty() {
-                None
-            } else {
-                Some(rendered)
-            }
+        if self.state == ClientState::Ready {
+            self.transport.send(&message)?;
+        } else {
+            self.queued_messages.push(message);
         }
-        Value::Object(map) => {
-            if let Some(text) = map.get("value").and_then(Value::as_str) {
-                return Some(text.to_string());
-            }
 
-            if let (Some(language), Some(value)) = (
-                map.get("language").and_then(Value::as_str),
-                map.get("value").and_then(Value::as_str),
-            ) {
-                return Some(format!("{language}: {value}"));
-            }
-
-            None
-        }
-        _ => None,
+        Ok(())
     }
 }
 
-fn parse_definition(result: Option<&Value>) -> Option<LspLocation> {
-    let result = result?;
-
-    if let Some(location) = parse_location_value(result) {
-        return Some(location);
-    }
-
-    result
-        .as_array()
-        .and_then(|items| items.iter().find_map(parse_location_value))
-}
-
-fn parse_location_value(value: &Value) -> Option<LspLocation> {
-    let uri = value
-        .get("uri")
-        .or_else(|| value.get("targetUri"))?
-        .as_str()?
-        .to_string();
-    let path = uri_to_path(&uri)?;
-    let range = value
-        .get("range")
-        .or_else(|| value.get("targetSelectionRange"))
-        .or_else(|| value.get("targetRange"))?;
-    let start = range.get("start")?;
-
-    Some(LspLocation {
-        path,
-        line: start.get("line")?.as_u64()? as u32,
-        character: start.get("character")?.as_u64()? as u32,
-    })
-}
-
-fn path_to_uri(path: &Path) -> Result<String> {
-    let url = Url::from_file_path(path)
-        .map_err(|_| anyhow!("failed to create file URI for {}", path.display()))?;
-    Ok(url.to_string())
-}
-
-fn uri_to_path(uri: &str) -> Option<PathBuf> {
-    Url::parse(uri).ok()?.to_file_path().ok()
+fn path_to_uri(path: &Path) -> Result<Url> {
+    Url::from_file_path(path)
+        .map_err(|_| anyhow!("failed to convert {} to file URI", path.display()))
 }
 
 fn language_id(path: &Path) -> &'static str {
@@ -519,4 +422,46 @@ fn language_id(path: &Path) -> &'static str {
         Some("rs") => "rust",
         _ => "plaintext",
     }
+}
+
+
+fn render_hover_contents(contents: HoverContents) -> String {
+    match contents {
+        HoverContents::Scalar(marked) => render_marked_string(marked),
+        HoverContents::Array(items) => items
+            .into_iter()
+            .map(render_marked_string)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        HoverContents::Markup(markup) => markup.value,
+    }
+}
+
+fn render_marked_string(marked: MarkedString) -> String {
+    match marked {
+        MarkedString::String(text) => text,
+        MarkedString::LanguageString(block) => format!("{}\n{}", block.language, block.value),
+    }
+}
+
+fn first_definition_location(response: GotoDefinitionResponse) -> Option<(PathBuf, u32, u32)> {
+    match response {
+        GotoDefinitionResponse::Scalar(loc) => location_to_file_position(loc),
+        GotoDefinitionResponse::Array(locs) => {
+            locs.into_iter().next().and_then(location_to_file_position)
+        }
+        GotoDefinitionResponse::Link(links) => links.into_iter().next().and_then(|link| {
+            link.target_uri.to_file_path().ok().map(|path| {
+                let pos = link.target_selection_range.start;
+                (path, pos.line, pos.character)
+            })
+        }),
+    }
+}
+
+fn location_to_file_position(loc: Location) -> Option<(PathBuf, u32, u32)> {
+    loc.uri
+        .to_file_path()
+        .ok()
+        .map(|path| (path, loc.range.start.line, loc.range.start.character))
 }

@@ -71,5 +71,6 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> R
         }
     }
 
+    app.shutdown();
     Ok(())
 }
