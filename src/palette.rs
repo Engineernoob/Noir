@@ -1,16 +1,44 @@
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaletteMode {
+    #[default]
+    File,
+    Command,
+}
+
 pub struct CommandPalette {
     pub open: bool,
     pub input: String,
+    pub mode: PaletteMode,
     pub selected: usize,
     pub results: Vec<String>,
+}
+
+impl Default for CommandPalette {
+    fn default() -> Self {
+        Self {
+            open: false,
+            input: String::new(),
+            mode: PaletteMode::File,
+            selected: 0,
+            results: Vec::new(),
+        }
+    }
 }
 
 impl CommandPalette {
     pub fn open(&mut self) {
         self.open = true;
+        self.mode = PaletteMode::File;
+        self.input.clear();
+        self.selected = 0;
+        self.results.clear();
+    }
+
+    pub fn open_command_mode(&mut self) {
+        self.open = true;
+        self.mode = PaletteMode::Command;
         self.input.clear();
         self.selected = 0;
         self.results.clear();
@@ -19,18 +47,20 @@ impl CommandPalette {
     pub fn close(&mut self) {
         self.open = false;
         self.input.clear();
+        self.mode = PaletteMode::File;
         self.selected = 0;
         self.results.clear();
     }
 
     pub fn toggle(&mut self) {
-        if self.open {
+        if self.open && self.mode == PaletteMode::File {
             self.close();
         } else {
             self.open();
         }
     }
 
+    /// Fuzzy-filter `candidates` (file names or command names) into `results`.
     pub fn update_results<I>(&mut self, candidates: I)
     where
         I: IntoIterator<Item = String>,

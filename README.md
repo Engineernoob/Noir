@@ -3,54 +3,64 @@
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange)
 
-**Noir** is a keyboard-first **terminal-based IDE written in Rust**.
-
-Built with `ratatui` and `crossterm`, Noir aims to provide a fast, minimal, and focused development environment directly inside the terminal.
-
-Instead of replicating full GUI IDE complexity, Noir focuses on the core developer workflow:
-
-- navigate projects
-- edit files
-- run commands
-- stay in the terminal
+> A terminal-native code editor built for people who want the power of Neovim
+> without the configuration rabbit hole.
 
 ---
 
-## ✨ Features (Current)
+## 🧠 What is Noir?
 
-- Terminal UI powered by **ratatui**
-- Project **file explorer**
-- Basic **text editor**
-- **Rope-based text buffer** using `ropey`
-- **Pane focus system**
-- **Open and save files**
-- Status bar with cursor position and file state
+**Noir is a keyboard-first terminal editor written in Rust.**
+
+It’s designed to sit between:
+
+* ⚡ **Neovim** → powerful but complex
+* 🧠 **VS Code** → easy but heavy
+
+Noir aims to be:
+
+* fast
+* minimal
+* discoverable
+* and actually usable out of the box
+
+No plugins required. No Lua configs. No 2-hour setup.
 
 ---
 
-## 🚧 Planned Features
+## ✨ Current Features
 
-The roadmap for Noir includes:
+* 🖥 Terminal UI powered by **ratatui**
+* 📁 Project **file explorer**
+* ✍️ Rope-based **text editor** (`ropey`)
+* 🔄 **Pane system** (editor / explorer)
+* 💾 Open and save files
+* 📍 Cursor tracking + status bar
+* ⚡ Fast startup, low resource usage
 
-- Multiple editor **tabs**
-- **Syntax highlighting** (tree-sitter)
-- **Command palette**
-- **Project-wide search**
-- **Embedded terminal pane**
-- **LSP support**
-- **Git integration**
-- **Configurable themes**
-- **Plugin system**
+---
+
+## 🚧 What’s Coming Next
+
+Noir is actively evolving toward a full terminal IDE:
+
+* 🧠 **LSP support** (multi-language, not just Rust)
+* 🎨 **Tree-sitter syntax highlighting**
+* 🔍 **Project-wide search**
+* 🧾 **Command palette**
+* 🖥 **Embedded terminal pane**
+* 🌳 **Nested file tree**
+* 🔀 **Git integration**
+* 🎛 Config + themes
+* 🔌 Lightweight plugin system
 
 ---
 
 ## 🖥 Layout
 
-Noir uses a simple IDE layout:
-
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
-│ Noir — Terminal IDE                                                    │
+│ Noir                                                                   │
 ├───────────────┬────────────────────────────────────────────────────────┤
 │               │                                                        │
 │  Explorer     │  src/main.rs                                          │
@@ -60,10 +70,8 @@ Noir uses a simple IDE layout:
 │   ├ app.rs    │  3  }                                                  │
 │   ├ ui.rs     │                                                        │
 │               │                                                        │
-│               │                                                        │
-│               │                                                        │
 ├───────────────┴────────────────────────────────────────────────────────┤
-│ EDITOR | root:noir | src/main.rs | Ln 2, Col 12 | OK                   │
+│ EDITOR | root:noir | Ln 2, Col 12 | OK                                 │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -73,82 +81,73 @@ Noir uses a simple IDE layout:
 
 | Key         | Action           |
 | ----------- | ---------------- |
-| `Ctrl+Q`    | Quit Noir        |
-| `Ctrl+S`    | Save file        |
-| `Ctrl+B`    | Focus file tree  |
+| `Ctrl+Q`    | Quit             |
+| `Ctrl+S`    | Save             |
+| `Ctrl+B`    | Focus explorer   |
 | `Ctrl+E`    | Focus editor     |
 | `Tab`       | Switch pane      |
-| `↑ ↓`       | Move selection   |
+| `↑ ↓`       | Navigate         |
 | `Enter`     | Open file        |
 | `Backspace` | Delete character |
 
 ---
 
-## ⚙️ Installation
+## ⚙️ Getting Started
 
 ### Requirements
 
-- Rust 1.70+
-- Cargo
+* Rust 1.70+
+* Cargo
 
-### Clone the repo
+### Run Noir
 
 ```bash
 git clone https://github.com/Engineernoob/noir.git
 cd noir
+cargo run -- .
 ```
 
-Run Noir
-cargo run -- .
-
-You can also open another project:
+Open another project:
 
 ```bash
 cargo run -- /path/to/project
 ```
 
-## Philosophy
+---
 
-Noir is built around a few principles:
+## 🎯 Philosophy
 
-- Keyboard-first workflow
+Noir is built around a few ideas:
 
-- Minimal UI
+* **Stay in the terminal**
+* **Keyboard-first everything**
+* **Minimal but powerful**
+* **Good defaults over heavy configuration**
 
-- Fast startup
+You shouldn’t need to fight your editor to use it.
 
-- Terminal-native experience
+---
 
-The goal is not to replicate VS Code in the terminal, but to create a focused environment for developers who prefer working in the shell.
+## 🛠 Built With
 
-🛠 Built With
+* Rust
+* ratatui
+* crossterm
+* ropey
+* walkdir
 
-Rust
+---
 
-ratatui
+## 🤝 Contributing
 
-crossterm
+If Noir sounds like something you’d use, help build it.
 
-ropey
+* Fork the repo
+* Create a feature branch
+* Open a PR
 
-walkdir
+---
 
-## License
+## 🖤 Noir
 
-MIT License
-
-## Contributing
-
-Contributions are welcome.
-
-If you want to help build Noir:
-
-- Fork the repository
-
-- Create a feature branch
-
-- Submit a pull request
-
-## Noir
-
-Code in the dark.
+> Code in the dark.

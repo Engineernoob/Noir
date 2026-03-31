@@ -17,6 +17,12 @@ pub enum TransportEvent {
     Closed,
 }
 
+/// Owns the child process and its stdin/stdout pipes.
+///
+/// A background thread reads Content-Length–framed JSON-RPC messages from the
+/// server's stdout and forwards them through an mpsc channel. The main thread
+/// writes to stdin via [`send`](Self::send) and drains the channel via
+/// [`try_recv`](Self::try_recv).
 pub struct StdioTransport {
     stdin: ChildStdin,
     events: Receiver<TransportEvent>,
@@ -24,13 +30,15 @@ pub struct StdioTransport {
 }
 
 impl StdioTransport {
-    pub fn start(server: &str) -> Result<Self> {
-        let mut child = Command::new(server)
+    /// Spawn `command` with `args` and connect its stdin/stdout for JSON-RPC.
+    pub fn start(command: &str, args: &[String]) -> Result<Self> {
+        let mut child = Command::new(command)
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .with_context(|| format!("failed to spawn {server}"))?;
+            .with_context(|| format!("failed to spawn LSP server '{command}'"))?;
 
         let stdin = child
             .stdin
@@ -46,7 +54,7 @@ impl StdioTransport {
             let mut reader = BufReader::new(stdout);
 
             loop {
-                match read_value(&mut reader) {
+                match read_message(&mut reader) {
                     Ok(Some(value)) => match parse_incoming_message(value) {
                         Ok(message) => {
                             if tx.send(TransportEvent::Message(message)).is_err() {
@@ -77,10 +85,12 @@ impl StdioTransport {
         })
     }
 
+    /// Serialize `message` as JSON and write it with a `Content-Length` header.
     pub fn send<T: Serialize>(&mut self, message: &T) -> Result<()> {
         write_message(&mut self.stdin, message).context("failed to write JSON-RPC message")
     }
 
+    /// Returns the next pending event without blocking, or `None`.
     pub fn try_recv(&self) -> Option<TransportEvent> {
         self.events.try_recv().ok()
     }
@@ -95,15 +105,15 @@ impl Drop for StdioTransport {
     }
 }
 
-fn read_value(reader: &mut BufReader<ChildStdout>) -> io::Result<Option<Value>> {
-    let mut content_length = None;
+/// Read one Content-Length–framed JSON value from `reader`.
+/// Returns `Ok(None)` when the stream is cleanly closed.
+fn read_message(reader: &mut BufReader<ChildStdout>) -> io::Result<Option<Value>> {
+    let mut content_length: Option<usize> = None;
 
     loop {
         let mut header = String::new();
-        let bytes_read = reader.read_line(&mut header)?;
-
-        if bytes_read == 0 {
-            return Ok(None);
+        if reader.read_line(&mut header)? == 0 {
+            return Ok(None); // EOF
         }
 
         if header == "\r\n" || header == "\n" {
@@ -112,45 +122,40 @@ fn read_value(reader: &mut BufReader<ChildStdout>) -> io::Result<Option<Value>> 
 
         if let Some((name, value)) = header.split_once(':') {
             if name.eq_ignore_ascii_case("Content-Length") {
-                let parsed_length = value.trim().parse::<usize>().map_err(|err| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("invalid length: {err}"))
+                let len = value.trim().parse::<usize>().map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid Content-Length: {e}"),
+                    )
                 })?;
-
-                content_length = Some(parsed_length);
+                content_length = Some(len);
             }
         }
     }
 
-    let Some(content_length) = content_length else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "missing Content-Length header",
-        ));
-    };
-
-    let mut body = vec![0; content_length];
-    std::io::Read::read_exact(reader, &mut body)?;
-
-    let message = serde_json::from_slice(&body).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid JSON-RPC body: {err}"),
-        )
+    let length = content_length.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
     })?;
 
-    Ok(Some(message))
+    let mut body = vec![0u8; length];
+    io::Read::read_exact(reader, &mut body)?;
+
+    serde_json::from_slice(&body).map(Some).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid JSON-RPC body: {e}"),
+        )
+    })
 }
 
 fn write_message(writer: &mut impl Write, message: &impl Serialize) -> io::Result<()> {
-    let body = serde_json::to_vec(message).map_err(|err| {
+    let body = serde_json::to_vec(message).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("failed to serialize JSON-RPC message: {err}"),
+            format!("failed to serialize JSON-RPC message: {e}"),
         )
     })?;
-
-    let header = format!("Content-Length: {}\r\n\r\n", body.len());
-    writer.write_all(header.as_bytes())?;
+    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
     writer.write_all(&body)?;
     writer.flush()
 }

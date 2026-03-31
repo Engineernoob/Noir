@@ -8,13 +8,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
+All commands must be run from the `noir/` subdirectory (where `Cargo.toml` lives).
+
 ```bash
 cargo build              # Build
 cargo run -- .           # Run in current directory
 cargo run -- /path       # Run in specific path
 cargo check              # Type-check without building
 cargo clippy             # Lint
-cargo test               # Run tests (none exist yet)
+cargo test               # Run all tests (none exist yet)
+cargo test <name>        # Run a single test by name
 ```
 
 ## Architecture

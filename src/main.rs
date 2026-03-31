@@ -1,8 +1,12 @@
 mod app;
+mod commands;
 mod editor;
+mod plugins;
 mod file_tree;
+mod languages;
 mod lsp;
 mod palette;
+mod search;
 mod syntax;
 mod terminal;
 mod ui;

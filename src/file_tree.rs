@@ -144,6 +144,10 @@ impl FileTree {
         self.all_files.iter().map(|(d, _)| d.clone()).collect()
     }
 
+    pub fn all_file_paths(&self) -> &[(String, PathBuf)] {
+        &self.all_files
+    }
+
     pub fn find_full_path_by_display(&self, display: &str) -> Option<&PathBuf> {
         self.all_files
             .iter()

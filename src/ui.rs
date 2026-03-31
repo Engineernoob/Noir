@@ -9,6 +9,8 @@ use ratatui::{
 use crate::{
     app::{App, FocusPane},
     lsp::DiagnosticSeverity,
+    palette::PaletteMode,
+    search::SearchResult,
 };
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -70,6 +72,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.palette.open {
         draw_palette(frame, centered_rect(70, 50, frame.area()), app);
+    }
+
+    if app.search.open {
+        draw_search(frame, centered_rect(80, 70, frame.area()), app);
     }
 
     if app.hover_visible {
@@ -313,11 +319,106 @@ fn draw_diagnostics(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+fn draw_search(frame: &mut Frame, area: Rect, app: &App) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(area);
+
+    // Input box
+    let query_display = format!("{}_", app.search.query);
+    let input = Paragraph::new(query_display)
+        .block(
+            Block::default()
+                .title(" Text Search (Ctrl+F) ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .alignment(Alignment::Left);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(input, sections[0]);
+
+    // Results list
+    let result_count = app.search.results.len();
+    let title = if app.search.query.is_empty() {
+        " Results ".to_string()
+    } else if result_count == 0 {
+        " Results — no matches ".to_string()
+    } else if result_count >= 200 {
+        format!(" Results — 200+ matches (showing first 200) ")
+    } else {
+        format!(" Results — {result_count} match{} ", if result_count == 1 { "" } else { "es" })
+    };
+
+    let items: Vec<ListItem> = if app.search.query.is_empty() {
+        vec![ListItem::new(Line::from(vec![Span::styled(
+            "  Start typing to search…",
+            Style::default().fg(Color::DarkGray),
+        )]))]
+    } else if app.search.results.is_empty() {
+        vec![ListItem::new(Line::from(vec![Span::styled(
+            "  No matches found",
+            Style::default().fg(Color::DarkGray),
+        )]))]
+    } else {
+        app.search
+            .results
+            .iter()
+            .map(|r| search_result_item(r, &app.root_dir))
+            .collect()
+    };
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("› ");
+
+    let mut state = ListState::default();
+    if !app.search.results.is_empty() {
+        state.select(Some(app.search.selected));
+    }
+
+    frame.render_stateful_widget(list, sections[1], &mut state);
+}
+
+fn search_result_item(result: &SearchResult, root: &std::path::Path) -> ListItem<'static> {
+    let rel = result
+        .path
+        .strip_prefix(root)
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| result.path.display().to_string());
+
+    let location = format!("{}:{}", rel, result.line + 1);
+    let snippet = truncate_str(&result.snippet, 60);
+
+    ListItem::new(Line::from(vec![
+        Span::styled(
+            format!("{location:<40}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(snippet, Style::default().fg(Color::Gray)),
+    ]))
+}
+
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let focus_label = match app.focus {
         FocusPane::FileTree => "FILES",
         FocusPane::Editor => "EDITOR",
         FocusPane::Palette => "PALETTE",
+        FocusPane::Search => "SEARCH",
         FocusPane::Terminal => "TERMINAL",
         FocusPane::Diagnostics => "DIAG",
     };
@@ -444,27 +545,69 @@ fn draw_palette(frame: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Length(3), Constraint::Min(1)])
         .split(area);
 
-    let input = Paragraph::new(app.palette.input.clone())
+    let (title, prompt) = match app.palette.mode {
+        PaletteMode::File => (" File Search  (type > for commands) ", String::new()),
+        PaletteMode::Command => (" Commands  (Backspace to return) ", "> ".to_string()),
+    };
+
+    let input_display = format!("{}{}_", prompt, app.palette.input);
+    let input = Paragraph::new(input_display)
         .block(
             Block::default()
-                .title(" File Search ")
+                .title(title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
         )
         .alignment(Alignment::Left);
 
     let items: Vec<ListItem> = if app.palette.results.is_empty() {
-        vec![ListItem::new("No matches")]
+        vec![ListItem::new(Span::styled(
+            "  No matches",
+            Style::default().fg(Color::DarkGray),
+        ))]
     } else {
-        app.palette
-            .results
-            .iter()
-            .map(|result| ListItem::new(result.clone()))
-            .collect()
+        match app.palette.mode {
+            PaletteMode::File => app
+                .palette
+                .results
+                .iter()
+                .map(|result| ListItem::new(result.clone()))
+                .collect(),
+            PaletteMode::Command => app
+                .palette
+                .results
+                .iter()
+                .map(|name| {
+                    let desc = app
+                        .commands
+                        .find_by_name(name)
+                        .map(|c| c.description)
+                        .unwrap_or("");
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!("{name:<28}"),
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(desc, Style::default().fg(Color::DarkGray)),
+                    ]))
+                })
+                .collect(),
+        }
+    };
+
+    let results_title = match app.palette.mode {
+        PaletteMode::File => " Files ",
+        PaletteMode::Command => " Commands ",
     };
 
     let results = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Results "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(results_title),
+        )
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
