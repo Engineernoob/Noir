@@ -1,14 +1,17 @@
 mod app;
 mod commands;
+mod config;
 mod editor;
 mod plugins;
 mod file_tree;
+mod keybindings;
 mod languages;
 mod lsp;
 mod palette;
 mod search;
 mod syntax;
 mod terminal;
+mod theme;
 mod ui;
 mod util;
 
@@ -27,12 +30,14 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use app::{Action, App};
+use config::Config;
 
 fn main() -> Result<()> {
     let root = env::args().nth(1).unwrap_or_else(|| ".".to_string());
+    let config = Config::load()?;
 
     let mut terminal = setup_terminal()?;
-    let result = run_app(&mut terminal, App::new(root)?);
+    let result = run_app(&mut terminal, App::new(root, config)?);
     restore_terminal(&mut terminal)?;
 
     result

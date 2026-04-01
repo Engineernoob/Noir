@@ -11,24 +11,26 @@ pub struct TerminalPane {
     pub visible: bool,
     pub lines: Vec<String>,
     pub scroll: usize,
+    scrollback_limit: usize,
     shell_input: Option<Box<dyn Write + Send>>,
     output_rx: Option<Receiver<String>>,
     _pty_pair: Option<PtyPair>,
 }
 
 impl TerminalPane {
-    pub fn new() -> Self {
+    pub fn new(scrollback_limit: usize) -> Self {
         Self {
             visible: true,
             lines: vec!["Starting Noir PTY shell...".to_string()],
             scroll: 0,
+            scrollback_limit: scrollback_limit.max(1),
             shell_input: None,
             output_rx: None,
             _pty_pair: None,
         }
     }
 
-    pub fn init_shell(&mut self) -> Result<()> {
+    pub fn init_shell(&mut self, shell: Option<&str>) -> Result<()> {
         let pty_system = native_pty_system();
         let pty_pair = pty_system.openpty(PtySize {
             rows: 24,
@@ -37,7 +39,10 @@ impl TerminalPane {
             pixel_height: 0,
         })?;
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        let shell = shell
+            .map(ToOwned::to_owned)
+            .or_else(|| std::env::var("SHELL").ok())
+            .unwrap_or_else(|| "/bin/zsh".to_string());
         let cmd = CommandBuilder::new(shell);
         let _child = pty_pair.slave.spawn_command(cmd)?;
 
@@ -160,8 +165,8 @@ impl TerminalPane {
             }
         }
 
-        if self.lines.len() > 5000 {
-            let drain_count = self.lines.len() - 5000;
+        if self.lines.len() > self.scrollback_limit {
+            let drain_count = self.lines.len() - self.scrollback_limit;
             self.lines.drain(0..drain_count);
         }
 

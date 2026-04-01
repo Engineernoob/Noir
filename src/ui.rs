@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs},
 };
@@ -11,15 +11,17 @@ use crate::{
     lsp::DiagnosticSeverity,
     palette::PaletteMode,
     search::SearchResult,
+    theme::Theme,
 };
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    let status_height = if app.show_status_bar { 1 } else { 0 };
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(status_height),
         ])
         .split(frame.area());
 
@@ -40,7 +42,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .split(body[0]);
 
         let editor_height = top[1].height.saturating_sub(2) as usize;
-        let editor_width = top[1].width.saturating_sub(7) as usize;
+        let editor_width = editor_content_width(top[1], app.show_line_numbers);
         app.set_editor_viewport(editor_height, editor_width);
 
         draw_file_tree(frame, top[0], app);
@@ -61,14 +63,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .split(root[1]);
 
         let editor_height = main[1].height.saturating_sub(2) as usize;
-        let editor_width = main[1].width.saturating_sub(7) as usize;
+        let editor_width = editor_content_width(main[1], app.show_line_numbers);
         app.set_editor_viewport(editor_height, editor_width);
 
         draw_file_tree(frame, main[0], app);
         draw_editor(frame, main[1], app);
     }
 
-    draw_status(frame, root[2], app);
+    if app.show_status_bar {
+        draw_status(frame, root[2], app);
+    }
 
     if app.palette.open {
         draw_palette(frame, centered_rect(70, 50, frame.area()), app);
@@ -95,7 +99,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
         .block(Block::default().borders(Borders::BOTTOM))
         .highlight_style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(app.theme.accent)
                 .add_modifier(Modifier::BOLD),
         )
         .select(app.editor.active);
@@ -115,11 +119,11 @@ fn draw_file_tree(frame: &mut Frame, area: Rect, app: &App) {
                 let icon = if entry.expanded { "▼ " } else { "▶ " };
                 let label = format!("{}/", entry.name);
                 let style = Style::default()
-                    .fg(Color::Cyan)
+                    .fg(app.theme.accent_alt)
                     .add_modifier(Modifier::BOLD);
                 (icon, label, style)
             } else {
-                ("  ", entry.name.clone(), Style::default().fg(Color::White))
+                ("  ", entry.name.clone(), Style::default().fg(app.theme.text))
             };
 
             ListItem::new(Span::styled(
@@ -133,7 +137,7 @@ fn draw_file_tree(frame: &mut Frame, area: Rect, app: &App) {
         .title(" Files ")
         .borders(Borders::ALL)
         .border_style(if app.focus == FocusPane::FileTree {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(app.theme.accent)
         } else {
             Style::default()
         });
@@ -142,7 +146,7 @@ fn draw_file_tree(frame: &mut Frame, area: Rect, app: &App) {
         .block(block)
         .highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(app.theme.selection_bg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("›");
@@ -155,7 +159,8 @@ fn draw_file_tree(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_editor(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner_height = area.height.saturating_sub(2) as usize;
-    let inner_width = area.width.saturating_sub(7) as usize;
+    let inner_width = editor_content_width(area, app.show_line_numbers);
+    let gutter_width = editor_gutter_width(app.show_line_numbers) as u16;
 
     let lines = app.editor.lines_for_render(inner_height, inner_width);
     let scroll_y = app.editor.current_buffer().scroll_y;
@@ -165,13 +170,17 @@ fn draw_editor(frame: &mut Frame, area: Rect, app: &mut App) {
         .enumerate()
         .map(|(i, line)| {
             let line_no = scroll_y + i + 1;
-            let mut spans = vec![Span::styled(
-                format!("{:>4} ", line_no),
-                Style::default().fg(Color::DarkGray),
-            )];
+            let mut spans = Vec::new();
+
+            if app.show_line_numbers {
+                spans.push(Span::styled(
+                    format!("{:>4} ", line_no),
+                    Style::default().fg(app.theme.muted),
+                ));
+            }
 
             let tokens = app.editor.syntax.highlight(&line);
-            spans.extend(highlighted_spans(&line, tokens));
+            spans.extend(highlighted_spans(&line, tokens, &app.theme));
 
             Line::from(spans)
         })
@@ -181,7 +190,7 @@ fn draw_editor(frame: &mut Frame, area: Rect, app: &mut App) {
         .title(" Editor ")
         .borders(Borders::ALL)
         .border_style(if app.focus == FocusPane::Editor {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(app.theme.accent)
         } else {
             Style::default()
         });
@@ -192,7 +201,7 @@ fn draw_editor(frame: &mut Frame, area: Rect, app: &mut App) {
     if app.focus == FocusPane::Editor {
         let (cursor_y, cursor_x) = app.editor.cursor_screen_position();
 
-        let x = area.x + 1 + 5 + cursor_x as u16;
+        let x = area.x + 1 + gutter_width + cursor_x as u16;
         let y = area.y + 1 + cursor_y as u16;
 
         let max_x = area.x + area.width.saturating_sub(2);
@@ -202,6 +211,15 @@ fn draw_editor(frame: &mut Frame, area: Rect, app: &mut App) {
             frame.set_cursor_position((x, y));
         }
     }
+}
+
+fn editor_gutter_width(show_line_numbers: bool) -> usize {
+    if show_line_numbers { 5 } else { 0 }
+}
+
+fn editor_content_width(area: Rect, show_line_numbers: bool) -> usize {
+    area.width
+        .saturating_sub(2 + editor_gutter_width(show_line_numbers) as u16) as usize
 }
 
 fn draw_terminal(frame: &mut Frame, area: Rect, app: &App) {
@@ -218,7 +236,7 @@ fn draw_terminal(frame: &mut Frame, area: Rect, app: &App) {
         .title(" Terminal ")
         .borders(Borders::ALL)
         .border_style(if app.focus == FocusPane::Terminal {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(app.theme.accent)
         } else {
             Style::default()
         });
@@ -261,7 +279,7 @@ fn draw_diagnostics(frame: &mut Frame, area: Rect, app: &App) {
         .title(title)
         .borders(Borders::ALL)
         .border_style(if is_focused {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(app.theme.accent)
         } else {
             Style::default()
         });
@@ -269,13 +287,13 @@ fn draw_diagnostics(frame: &mut Frame, area: Rect, app: &App) {
     let items: Vec<ListItem> = if app.diagnostics_entries.is_empty() {
         vec![ListItem::new(Line::from(vec![Span::styled(
             "  No diagnostics",
-            Style::default().fg(Color::Green),
+            Style::default().fg(app.theme.success_bg),
         )]))]
     } else {
         app.diagnostics_entries
             .iter()
             .map(|entry| {
-                let (badge, badge_style) = severity_badge(entry.severity);
+                let (badge, badge_style) = severity_badge(entry.severity, &app.theme);
 
                 let rel_path = entry
                     .path
@@ -293,10 +311,10 @@ fn draw_diagnostics(frame: &mut Frame, area: Rect, app: &App) {
                     Span::styled(
                         format!("{location:<32}"),
                         Style::default()
-                            .fg(Color::White)
+                            .fg(app.theme.text)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(msg, Style::default().fg(Color::Gray)),
+                    Span::styled(msg, Style::default().fg(app.theme.muted)),
                 ]))
             })
             .collect()
@@ -306,7 +324,7 @@ fn draw_diagnostics(frame: &mut Frame, area: Rect, app: &App) {
         .block(block)
         .highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(app.theme.selection_bg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("›");
@@ -332,7 +350,7 @@ fn draw_search(frame: &mut Frame, area: Rect, app: &App) {
             Block::default()
                 .title(" Text Search (Ctrl+F) ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
+                .border_style(Style::default().fg(app.theme.accent)),
         )
         .alignment(Alignment::Left);
 
@@ -354,18 +372,18 @@ fn draw_search(frame: &mut Frame, area: Rect, app: &App) {
     let items: Vec<ListItem> = if app.search.query.is_empty() {
         vec![ListItem::new(Line::from(vec![Span::styled(
             "  Start typing to search…",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(app.theme.muted),
         )]))]
     } else if app.search.results.is_empty() {
         vec![ListItem::new(Line::from(vec![Span::styled(
             "  No matches found",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(app.theme.muted),
         )]))]
     } else {
         app.search
             .results
             .iter()
-            .map(|r| search_result_item(r, &app.root_dir))
+            .map(|r| search_result_item(r, &app.root_dir, &app.theme))
             .collect()
     };
 
@@ -374,11 +392,11 @@ fn draw_search(frame: &mut Frame, area: Rect, app: &App) {
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
+                .border_style(Style::default().fg(app.theme.accent)),
         )
         .highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(app.theme.selection_bg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("› ");
@@ -391,7 +409,11 @@ fn draw_search(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list, sections[1], &mut state);
 }
 
-fn search_result_item(result: &SearchResult, root: &std::path::Path) -> ListItem<'static> {
+fn search_result_item(
+    result: &SearchResult,
+    root: &std::path::Path,
+    theme: &Theme,
+) -> ListItem<'static> {
     let rel = result
         .path
         .strip_prefix(root)
@@ -406,10 +428,10 @@ fn search_result_item(result: &SearchResult, root: &std::path::Path) -> ListItem
         Span::styled(
             format!("{location:<40}"),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.accent_alt)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(snippet, Style::default().fg(Color::Gray)),
+        Span::styled(snippet, Style::default().fg(theme.muted)),
     ]))
 }
 
@@ -452,8 +474,8 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(
             format!(" {} ", focus_label),
             Style::default()
-                .bg(Color::Black)
-                .fg(Color::Yellow)
+                .bg(app.theme.status_label_bg)
+                .fg(app.theme.status_label_fg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
@@ -470,13 +492,13 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             format!(" {} ", dirty),
             if buf.dirty {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
+                    .fg(app.theme.warning_fg)
+                    .bg(app.theme.warning_bg)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Green)
+                    .fg(app.theme.success_fg)
+                    .bg(app.theme.success_bg)
                     .add_modifier(Modifier::BOLD)
             },
         ),
@@ -489,8 +511,8 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             spans.push(Span::styled(
                 format!(" ✗{} ", error_count),
                 Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Red)
+                    .fg(app.theme.error_fg)
+                    .bg(app.theme.error_bg)
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -498,8 +520,8 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             spans.push(Span::styled(
                 format!(" ⚠{} ", warning_count),
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
+                    .fg(app.theme.warning_fg)
+                    .bg(app.theme.warning_bg)
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -507,8 +529,8 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             spans.push(Span::styled(
                 " ✓ ",
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Green)
+                    .fg(app.theme.success_fg)
+                    .bg(app.theme.success_bg)
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -519,8 +541,11 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     spans.push(Span::raw(app.status.clone()));
 
     let status = Line::from(spans);
-    let paragraph =
-        Paragraph::new(status).style(Style::default().bg(Color::White).fg(Color::Black));
+    let paragraph = Paragraph::new(status).style(
+        Style::default()
+            .bg(app.theme.status_bg)
+            .fg(app.theme.status_fg),
+    );
     frame.render_widget(paragraph, area);
 }
 
@@ -531,7 +556,7 @@ fn draw_hover(frame: &mut Frame, area: Rect, app: &App) {
             Block::default()
                 .title(" Hover ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
+                .border_style(Style::default().fg(app.theme.accent)),
         )
         .wrap(ratatui::widgets::Wrap { trim: false });
 
@@ -556,14 +581,14 @@ fn draw_palette(frame: &mut Frame, area: Rect, app: &App) {
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
+                .border_style(Style::default().fg(app.theme.accent)),
         )
         .alignment(Alignment::Left);
 
     let items: Vec<ListItem> = if app.palette.results.is_empty() {
         vec![ListItem::new(Span::styled(
             "  No matches",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(app.theme.muted),
         ))]
     } else {
         match app.palette.mode {
@@ -581,10 +606,10 @@ fn draw_palette(frame: &mut Frame, area: Rect, app: &App) {
                         Span::styled(
                             format!("{:<28}", command.title),
                             Style::default()
-                                .fg(Color::White)
+                                .fg(app.theme.text)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(&command.description, Style::default().fg(Color::DarkGray)),
+                        Span::styled(&command.description, Style::default().fg(app.theme.muted)),
                     ]))
                 })
                 .collect(),
@@ -604,7 +629,7 @@ fn draw_palette(frame: &mut Frame, area: Rect, app: &App) {
         )
         .highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(app.theme.selection_bg)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("› ");
@@ -621,19 +646,20 @@ fn draw_palette(frame: &mut Frame, area: Rect, app: &App) {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn token_style(kind: &str) -> Style {
+fn token_style(kind: &str, theme: &Theme) -> Style {
     match kind {
-        "comment" => Style::default().fg(Color::DarkGray),
-        "string" => Style::default().fg(Color::Green),
-        "type" => Style::default().fg(Color::Cyan),
-        "variable" => Style::default().fg(Color::White),
-        _ => Style::default().fg(Color::White),
+        "comment" => Style::default().fg(theme.syntax_comment),
+        "string" => Style::default().fg(theme.syntax_string),
+        "type" => Style::default().fg(theme.syntax_type),
+        "variable" => Style::default().fg(theme.syntax_variable),
+        _ => Style::default().fg(theme.text),
     }
 }
 
 fn highlighted_spans(
     line: &str,
     mut tokens: Vec<(usize, usize, &'static str)>,
+    theme: &Theme,
 ) -> Vec<Span<'static>> {
     tokens.sort_by_key(|(start, _, _)| *start);
 
@@ -647,14 +673,14 @@ fn highlighted_spans(
         if start > cursor {
             spans.push(Span::styled(
                 line[cursor..start].to_string(),
-                Style::default().fg(Color::White),
+                Style::default().fg(theme.text),
             ));
         }
 
         if end > start {
             spans.push(Span::styled(
                 line[start..end].to_string(),
-                token_style(kind),
+                token_style(kind, theme),
             ));
             cursor = end;
         }
@@ -663,14 +689,14 @@ fn highlighted_spans(
     if cursor < line.len() {
         spans.push(Span::styled(
             line[cursor..].to_string(),
-            Style::default().fg(Color::White),
+            Style::default().fg(theme.text),
         ));
     }
 
     if spans.is_empty() {
         spans.push(Span::styled(
             line.to_string(),
-            Style::default().fg(Color::White),
+            Style::default().fg(theme.text),
         ));
     }
 
@@ -678,29 +704,29 @@ fn highlighted_spans(
 }
 
 /// Returns a short fixed-width badge string and its style for a diagnostic severity.
-fn severity_badge(severity: Option<DiagnosticSeverity>) -> (&'static str, Style) {
+fn severity_badge(severity: Option<DiagnosticSeverity>, theme: &Theme) -> (&'static str, Style) {
     match severity {
         Some(DiagnosticSeverity::ERROR) => (
             " ERR ",
             Style::default()
-                .fg(Color::White)
-                .bg(Color::Red)
+                .fg(theme.error_fg)
+                .bg(theme.error_bg)
                 .add_modifier(Modifier::BOLD),
         ),
         Some(DiagnosticSeverity::WARNING) => (
             " WRN ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
+                .fg(theme.warning_fg)
+                .bg(theme.warning_bg)
                 .add_modifier(Modifier::BOLD),
         ),
         Some(DiagnosticSeverity::INFORMATION) => (
             " INF ",
-            Style::default().fg(Color::Black).bg(Color::Cyan),
+            Style::default().fg(theme.info_fg).bg(theme.info_bg),
         ),
         Some(DiagnosticSeverity::HINT) => (
             " HNT ",
-            Style::default().fg(Color::Black).bg(Color::DarkGray),
+            Style::default().fg(theme.status_fg).bg(theme.muted),
         ),
         _ => ("     ", Style::default()),
     }

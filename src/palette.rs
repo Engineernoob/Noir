@@ -51,15 +51,6 @@ impl CommandPalette {
         self.selected = 0;
         self.results.clear();
     }
-
-    pub fn toggle(&mut self) {
-        if self.open && self.mode == PaletteMode::File {
-            self.close();
-        } else {
-            self.open();
-        }
-    }
-
     /// Fuzzy-filter `candidates` (file names or command names) into `results`.
     pub fn update_results<I>(&mut self, candidates: I)
     where

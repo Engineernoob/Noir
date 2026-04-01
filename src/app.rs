@@ -8,8 +8,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
     commands::{CommandId, CommandRegistry, PaletteCommandEntry, PaletteCommandTarget},
+    config::Config,
     editor::Editor,
     file_tree::FileTree,
+    keybindings::{EditorAction, KeyContext, KeybindingRegistry},
     languages::LanguageRegistry,
     lsp::{DiagnosticSeverity, LspClient, LspDiagnostic, LspEvent},
     palette::{CommandPalette, PaletteMode},
@@ -19,6 +21,7 @@ use crate::{
     },
     search::SearchPanel,
     terminal::TerminalPane,
+    theme::Theme,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +54,10 @@ pub struct App {
     pub root_dir: PathBuf,
     /// Maps file extensions to language IDs and LSP server commands.
     pub registry: LanguageRegistry,
+    pub theme: Theme,
+    pub show_line_numbers: bool,
+    pub show_status_bar: bool,
+    pub keybindings: KeybindingRegistry,
     pub commands: CommandRegistry,
     pub plugins: PluginManager,
     pub file_tree: FileTree,
@@ -78,11 +85,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new<P: AsRef<Path>>(root: P) -> Result<Self> {
+    pub fn new<P: AsRef<Path>>(root: P, config: Config) -> Result<Self> {
         let root_dir = root.as_ref().canonicalize()?;
         let file_tree = FileTree::new(&root_dir)?;
         let mut editor = Editor::default();
-        let mut terminal = TerminalPane::new();
+        editor.configure(config.editor.tab_width, config.editor.soft_tabs);
+        let mut terminal = TerminalPane::new(config.terminal.scrollback);
+        let theme = Theme::from_name(&config.theme.name);
 
         let initial_file = file_tree
             .selected_path()
@@ -92,7 +101,8 @@ impl App {
             editor.open_file(path)?;
         }
 
-        terminal.init_shell()?;
+        terminal.init_shell(config.terminal.shell.as_deref())?;
+        terminal.visible = config.terminal.visible;
 
         // Build the language registry. Additional servers can be registered here
         // as Noir gains support for more languages.
@@ -114,12 +124,20 @@ impl App {
 
         // Discover plugins from `<root>/.noir/plugins/`. Missing directory is fine.
         let mut plugins = PluginManager::new();
-        let _ = plugins.discover(&root_dir.join(".noir").join("plugins"));
-        let plugin_startup = plugins.start_enabled();
+        let plugin_startup = if config.plugins.enabled {
+            let _ = plugins.discover(&root_dir.join(".noir").join("plugins"));
+            plugins.start_enabled()
+        } else {
+            PluginStartupSummary::default()
+        };
 
         let mut app = Self {
             root_dir: root_dir.clone(),
             registry,
+            theme,
+            show_line_numbers: config.editor.line_numbers,
+            show_status_bar: config.editor.show_status_bar,
+            keybindings: KeybindingRegistry::new(),
             commands: CommandRegistry::default(),
             plugins,
             file_tree,
@@ -184,133 +202,8 @@ impl App {
             return self.handle_search_key(key);
         }
 
-        if key.modifiers.contains(KeyModifiers::ALT) {
-            match key.code {
-                KeyCode::Char('1') => {
-                    self.focus = FocusPane::FileTree;
-                    self.status = "Focus: file tree".to_string();
-                    return Ok(Action::None);
-                }
-                KeyCode::Char('2') => {
-                    self.focus = FocusPane::Editor;
-                    self.status = "Focus: editor".to_string();
-                    return Ok(Action::None);
-                }
-                KeyCode::Char('3') => {
-                    if self.terminal.visible {
-                        self.focus = FocusPane::Terminal;
-                        self.status = "Focus: terminal".to_string();
-                    }
-                    return Ok(Action::None);
-                }
-                KeyCode::Char('4') => {
-                    if self.diagnostics_open {
-                        self.focus = FocusPane::Diagnostics;
-                        self.status = "Focus: diagnostics".to_string();
-                    }
-                    return Ok(Action::None);
-                }
-                KeyCode::Char('.') => {
-                    self.editor.next_tab();
-                    self.editor
-                        .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
-                    let _ = self.sync_current_buffer_open();
-                    self.status = format!("Tab: {}", self.editor.title());
-                    return Ok(Action::None);
-                }
-                KeyCode::Char(',') => {
-                    self.editor.prev_tab();
-                    self.editor
-                        .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
-                    let _ = self.sync_current_buffer_open();
-                    self.status = format!("Tab: {}", self.editor.title());
-                    return Ok(Action::None);
-                }
-                _ => {}
-            }
-        }
-
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('q') => {
-                    self.should_quit = true;
-                    return Ok(Action::Quit);
-                }
-                KeyCode::Char('s') => {
-                    self.editor.save()?;
-                    self.status = "Saved".to_string();
-                    return Ok(Action::None);
-                }
-                KeyCode::Char('b') => {
-                    self.focus = FocusPane::FileTree;
-                    self.status = "Focus: file tree".to_string();
-                    return Ok(Action::None);
-                }
-                KeyCode::Char('e') => {
-                    self.focus = FocusPane::Editor;
-                    self.status = "Focus: editor".to_string();
-                    return Ok(Action::None);
-                }
-                KeyCode::Char('k') => {
-                    self.request_hover()?;
-                    return Ok(Action::None);
-                }
-                KeyCode::Char('g') => {
-                    self.request_definition()?;
-                    return Ok(Action::None);
-                }
-                KeyCode::Char('p') => {
-                    self.palette.toggle();
-                    if self.palette.open {
-                        self.refresh_palette_results();
-                        self.focus = FocusPane::Palette;
-                        self.status =
-                            "File search  [type] filter  [>] commands  [Esc] close".to_string();
-                    } else {
-                        self.focus = FocusPane::Editor;
-                        self.status = "Closed palette".to_string();
-                    }
-                    return Ok(Action::None);
-                }
-                KeyCode::Char('o') => {
-                    // Ctrl+O opens command palette directly in command mode
-                    self.palette.open_command_mode();
-                    self.refresh_palette_results();
-                    self.focus = FocusPane::Palette;
-                    self.status =
-                        "Commands  [type] filter  [Backspace] file search  [Esc] close".to_string();
-                    return Ok(Action::None);
-                }
-                KeyCode::Char('f') => {
-                    self.search.open();
-                    self.focus = FocusPane::Search;
-                    self.status = "Text search  [type to search]  [Enter] open  [Esc] close"
-                        .to_string();
-                    return Ok(Action::None);
-                }
-                KeyCode::Char('t') => {
-                    self.terminal.toggle();
-                    if self.terminal.visible {
-                        self.status = "Opened terminal".to_string();
-                    } else {
-                        if self.focus == FocusPane::Terminal {
-                            self.focus = FocusPane::Editor;
-                        }
-                        self.status = "Closed terminal".to_string();
-                    }
-                    return Ok(Action::None);
-                }
-                KeyCode::Char('d') => {
-                    self.toggle_diagnostics();
-                    return Ok(Action::None);
-                }
-                _ => {}
-            }
-        }
-
-        if key.code == KeyCode::F(12) {
-            self.request_definition()?;
-            return Ok(Action::None);
+        if let Some(action) = self.keybindings.action_for(KeyContext::Global, key) {
+            return self.execute_editor_action(action);
         }
 
         match self.focus {
@@ -324,124 +217,32 @@ impl App {
     }
 
     fn handle_file_tree_key(&mut self, key: KeyEvent) -> Result<Action> {
-        match key.code {
-            KeyCode::Up => self.file_tree.move_up(),
-            KeyCode::Down => self.file_tree.move_down(),
-            KeyCode::Right => self.file_tree.expand_selected(),
-            KeyCode::Left => self.file_tree.collapse_selected(),
-            KeyCode::Enter => {
-                if self.file_tree.selected_is_dir() {
-                    self.file_tree.toggle_expand();
-                } else if let Some(path) = self.file_tree.selected_path() {
-                    let path = path.clone();
-                    self.editor.open_file(&path)?;
-                    self.editor
-                        .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
-                    let _ = self.sync_current_buffer_open();
-                    self.focus = FocusPane::Editor;
-                    self.status = format!("Opened {}", path.display());
-                }
-            }
-            KeyCode::Tab => {
-                self.focus = FocusPane::Editor;
-                self.status = "Focus: editor".to_string();
-            }
-            _ => {}
+        if let Some(action) = self.keybindings.action_for(KeyContext::FileTree, key) {
+            return self.execute_editor_action(action);
         }
         Ok(Action::None)
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent) -> Result<Action> {
-        match key.code {
-            KeyCode::Esc => {
-                if self.hover_visible {
-                    self.hover_visible = false;
-                    self.status = "Closed hover".to_string();
-                }
-            }
-            KeyCode::Tab => {
-                if self.terminal.visible {
-                    self.focus = FocusPane::Terminal;
-                    self.status = "Focus: terminal".to_string();
-                } else {
-                    self.focus = FocusPane::FileTree;
-                    self.status = "Focus: file tree".to_string();
-                }
-            }
-            _ => {
-                let changed = self.editor.handle_key(key);
-                self.editor
-                    .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
-                if changed {
-                    self.sync_current_buffer_change()?;
-                }
-            }
+        if let Some(action) = self.keybindings.action_for(KeyContext::Editor, key) {
+            return self.execute_editor_action(action);
+        }
+
+        let changed = self.editor.handle_key(key);
+        self.editor
+            .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
+        if changed {
+            self.sync_current_buffer_change()?;
         }
         Ok(Action::None)
     }
 
     fn handle_palette_key(&mut self, key: KeyEvent) -> Result<Action> {
-        match key.code {
-            KeyCode::Esc => {
-                self.palette.close();
-                self.focus = FocusPane::Editor;
-                self.status = "Closed palette".to_string();
-            }
-            KeyCode::Up => self.palette.move_up(),
-            KeyCode::Down => self.palette.move_down(),
-            KeyCode::Backspace => {
-                if self.palette.mode == PaletteMode::Command && self.palette.input.is_empty() {
-                    // Backspace past command prompt → return to file mode.
-                    self.palette.mode = PaletteMode::File;
-                    self.status =
-                        "File search  [type] filter  [>] commands  [Esc] close".to_string();
-                } else {
-                    self.palette.input.pop();
-                }
-                self.refresh_palette_results();
-            }
-            KeyCode::Enter => {
-                match self.palette.mode {
-                    PaletteMode::File => {
-                        if let Some(selected) = self.palette.selected_result().map(str::to_string) {
-                            if let Some(path) =
-                                self.file_tree.find_full_path_by_display(&selected)
-                            {
-                                let path = path.clone();
-                                self.editor.open_file(&path)?;
-                                self.editor.ensure_cursor_visible(
-                                    self.editor_view_height,
-                                    self.editor_view_width,
-                                );
-                                let _ = self.sync_current_buffer_open();
-                                self.status = format!("Opened {}", selected);
-                            }
-                        }
-                        self.palette.close();
-                        self.focus = FocusPane::Editor;
-                    }
-                    PaletteMode::Command => {
-                        if let Some(command) =
-                            self.command_results.get(self.palette.selected).cloned()
-                        {
-                            self.palette.close();
-                            self.focus = FocusPane::Editor;
+        if let Some(action) = self.keybindings.action_for(KeyContext::Palette, key) {
+            return self.execute_editor_action(action);
+        }
 
-                            match command.target {
-                                PaletteCommandTarget::BuiltIn(id) => {
-                                    return self.execute_command(id);
-                                }
-                                PaletteCommandTarget::Plugin {
-                                    plugin_name,
-                                    command_name,
-                                } => {
-                                    self.execute_plugin_command(&plugin_name, &command_name)?;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        match key.code {
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // `>` as the first character in File mode switches to Command mode.
                 if self.palette.mode == PaletteMode::File && self.palette.input.is_empty() && c == '>' {
@@ -606,85 +407,32 @@ impl App {
     }
 
     fn handle_terminal_key(&mut self, key: KeyEvent) -> Result<Action> {
+        if let Some(action) = self.keybindings.action_for(KeyContext::Terminal, key) {
+            return self.execute_editor_action(action);
+        }
+
         match key.code {
-            KeyCode::Up => self.terminal.scroll_up(),
-            KeyCode::Down => self.terminal.scroll_down(),
-            KeyCode::Tab => {
-                self.focus = FocusPane::FileTree;
-                self.status = "Focus: file tree".to_string();
-            }
-            KeyCode::Enter => self.terminal.send_enter(),
-            KeyCode::Backspace => self.terminal.send_backspace(),
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.terminal.send_key_char(c);
             }
-            KeyCode::Left => self.terminal.send_input("\u{1b}[D"),
-            KeyCode::Right => self.terminal.send_input("\u{1b}[C"),
-            KeyCode::Home => self.terminal.send_input("\u{1b}[H"),
-            KeyCode::End => self.terminal.send_input("\u{1b}[F"),
             _ => {}
         }
         Ok(Action::None)
     }
 
     fn handle_diagnostics_key(&mut self, key: KeyEvent) -> Result<Action> {
-        match key.code {
-            KeyCode::Up => {
-                if self.diagnostics_selected > 0 {
-                    self.diagnostics_selected -= 1;
-                }
-            }
-            KeyCode::Down => {
-                if !self.diagnostics_entries.is_empty()
-                    && self.diagnostics_selected + 1 < self.diagnostics_entries.len()
-                {
-                    self.diagnostics_selected += 1;
-                }
-            }
-            KeyCode::Enter => self.jump_to_diagnostic(),
-            KeyCode::Esc | KeyCode::Tab => {
-                self.diagnostics_open = false;
-                self.focus = FocusPane::Editor;
-                self.status = "Closed diagnostics".to_string();
-            }
-            _ => {}
+        if let Some(action) = self.keybindings.action_for(KeyContext::Diagnostics, key) {
+            return self.execute_editor_action(action);
         }
         Ok(Action::None)
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) -> Result<Action> {
+        if let Some(action) = self.keybindings.action_for(KeyContext::Search, key) {
+            return self.execute_editor_action(action);
+        }
+
         match key.code {
-            KeyCode::Esc => {
-                self.search.close();
-                self.focus = FocusPane::Editor;
-                self.status = "Closed search".to_string();
-            }
-            KeyCode::Up => self.search.move_up(),
-            KeyCode::Down => self.search.move_down(),
-            KeyCode::Enter => {
-                if let Some(result) = self.search.selected_result().cloned() {
-                    let path = result.path.clone();
-                    let line = result.line;
-                    if let Err(e) = self.editor.open_file(&path) {
-                        self.status = format!("Cannot open {}: {e}", path.display());
-                        return Ok(Action::None);
-                    }
-                    self.editor.current_buffer_mut().cursor_row = line as usize;
-                    self.editor.current_buffer_mut().cursor_col = 0;
-                    self.editor
-                        .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
-                    let _ = self.sync_current_buffer_open();
-                    self.search.close();
-                    self.focus = FocusPane::Editor;
-                    self.status =
-                        format!("Jumped to {}:{}", path.display(), line + 1);
-                }
-            }
-            KeyCode::Backspace => {
-                self.search.query.pop();
-                let all_files = self.file_tree.all_file_paths().to_vec();
-                self.search.run_search(&all_files);
-            }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.search.query.push(c);
                 let all_files = self.file_tree.all_file_paths().to_vec();
@@ -692,6 +440,270 @@ impl App {
             }
             _ => {}
         }
+        Ok(Action::None)
+    }
+
+    fn execute_editor_action(&mut self, action: EditorAction) -> Result<Action> {
+        match action {
+            EditorAction::Command(id) => self.execute_command(id),
+            EditorAction::OpenCommandPalette => {
+                self.palette.open_command_mode();
+                self.refresh_palette_results();
+                self.focus = FocusPane::Palette;
+                self.status =
+                    "Commands  [type] filter  [Backspace] file search  [Esc] close".to_string();
+                Ok(Action::None)
+            }
+            EditorAction::FocusTerminal => {
+                if self.terminal.visible {
+                    self.focus = FocusPane::Terminal;
+                    self.status = "Focus: terminal".to_string();
+                }
+                Ok(Action::None)
+            }
+            EditorAction::FocusDiagnostics => {
+                if self.diagnostics_open {
+                    self.focus = FocusPane::Diagnostics;
+                    self.status = "Focus: diagnostics".to_string();
+                }
+                Ok(Action::None)
+            }
+            EditorAction::NextEditorTab => {
+                self.editor.next_tab();
+                self.editor
+                    .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
+                let _ = self.sync_current_buffer_open();
+                self.status = format!("Tab: {}", self.editor.title());
+                Ok(Action::None)
+            }
+            EditorAction::PrevEditorTab => {
+                self.editor.prev_tab();
+                self.editor
+                    .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
+                let _ = self.sync_current_buffer_open();
+                self.status = format!("Tab: {}", self.editor.title());
+                Ok(Action::None)
+            }
+            EditorAction::FileTreeMoveUp => {
+                self.file_tree.move_up();
+                Ok(Action::None)
+            }
+            EditorAction::FileTreeMoveDown => {
+                self.file_tree.move_down();
+                Ok(Action::None)
+            }
+            EditorAction::FileTreeExpand => {
+                self.file_tree.expand_selected();
+                Ok(Action::None)
+            }
+            EditorAction::FileTreeCollapse => {
+                self.file_tree.collapse_selected();
+                Ok(Action::None)
+            }
+            EditorAction::FileTreeOpenSelected => self.open_selected_file_tree_entry(),
+            EditorAction::EditorDismissHover => {
+                if self.hover_visible {
+                    self.hover_visible = false;
+                    self.status = "Closed hover".to_string();
+                }
+                Ok(Action::None)
+            }
+            EditorAction::EditorCycleFocus => {
+                if self.terminal.visible {
+                    self.focus = FocusPane::Terminal;
+                    self.status = "Focus: terminal".to_string();
+                } else {
+                    self.focus = FocusPane::FileTree;
+                    self.status = "Focus: file tree".to_string();
+                }
+                Ok(Action::None)
+            }
+            EditorAction::PaletteClose => {
+                self.palette.close();
+                self.focus = FocusPane::Editor;
+                self.status = "Closed palette".to_string();
+                Ok(Action::None)
+            }
+            EditorAction::PaletteMoveUp => {
+                self.palette.move_up();
+                Ok(Action::None)
+            }
+            EditorAction::PaletteMoveDown => {
+                self.palette.move_down();
+                Ok(Action::None)
+            }
+            EditorAction::PaletteBackspace => {
+                if self.palette.mode == PaletteMode::Command && self.palette.input.is_empty() {
+                    self.palette.mode = PaletteMode::File;
+                    self.status =
+                        "File search  [type] filter  [>] commands  [Esc] close".to_string();
+                } else {
+                    self.palette.input.pop();
+                }
+                self.refresh_palette_results();
+                Ok(Action::None)
+            }
+            EditorAction::PaletteSubmit => self.submit_palette_selection(),
+            EditorAction::SearchClose => {
+                self.search.close();
+                self.focus = FocusPane::Editor;
+                self.status = "Closed search".to_string();
+                Ok(Action::None)
+            }
+            EditorAction::SearchMoveUp => {
+                self.search.move_up();
+                Ok(Action::None)
+            }
+            EditorAction::SearchMoveDown => {
+                self.search.move_down();
+                Ok(Action::None)
+            }
+            EditorAction::SearchSubmit => self.submit_search_selection(),
+            EditorAction::SearchBackspace => {
+                self.search.query.pop();
+                let all_files = self.file_tree.all_file_paths().to_vec();
+                self.search.run_search(&all_files);
+                Ok(Action::None)
+            }
+            EditorAction::TerminalScrollUp => {
+                self.terminal.scroll_up();
+                Ok(Action::None)
+            }
+            EditorAction::TerminalScrollDown => {
+                self.terminal.scroll_down();
+                Ok(Action::None)
+            }
+            EditorAction::TerminalFocusFileTree => {
+                self.focus = FocusPane::FileTree;
+                self.status = "Focus: file tree".to_string();
+                Ok(Action::None)
+            }
+            EditorAction::TerminalSendEnter => {
+                self.terminal.send_enter();
+                Ok(Action::None)
+            }
+            EditorAction::TerminalSendBackspace => {
+                self.terminal.send_backspace();
+                Ok(Action::None)
+            }
+            EditorAction::TerminalSendLeft => {
+                self.terminal.send_input("\u{1b}[D");
+                Ok(Action::None)
+            }
+            EditorAction::TerminalSendRight => {
+                self.terminal.send_input("\u{1b}[C");
+                Ok(Action::None)
+            }
+            EditorAction::TerminalSendHome => {
+                self.terminal.send_input("\u{1b}[H");
+                Ok(Action::None)
+            }
+            EditorAction::TerminalSendEnd => {
+                self.terminal.send_input("\u{1b}[F");
+                Ok(Action::None)
+            }
+            EditorAction::DiagnosticsMoveUp => {
+                if self.diagnostics_selected > 0 {
+                    self.diagnostics_selected -= 1;
+                }
+                Ok(Action::None)
+            }
+            EditorAction::DiagnosticsMoveDown => {
+                if !self.diagnostics_entries.is_empty()
+                    && self.diagnostics_selected + 1 < self.diagnostics_entries.len()
+                {
+                    self.diagnostics_selected += 1;
+                }
+                Ok(Action::None)
+            }
+            EditorAction::DiagnosticsSubmit => {
+                self.jump_to_diagnostic();
+                Ok(Action::None)
+            }
+            EditorAction::DiagnosticsClose => {
+                self.diagnostics_open = false;
+                self.focus = FocusPane::Editor;
+                self.status = "Closed diagnostics".to_string();
+                Ok(Action::None)
+            }
+        }
+    }
+
+    fn open_selected_file_tree_entry(&mut self) -> Result<Action> {
+        if self.file_tree.selected_is_dir() {
+            self.file_tree.toggle_expand();
+        } else if let Some(path) = self.file_tree.selected_path() {
+            let path = path.clone();
+            self.editor.open_file(&path)?;
+            self.editor
+                .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
+            let _ = self.sync_current_buffer_open();
+            self.focus = FocusPane::Editor;
+            self.status = format!("Opened {}", path.display());
+        }
+
+        Ok(Action::None)
+    }
+
+    fn submit_palette_selection(&mut self) -> Result<Action> {
+        match self.palette.mode {
+            PaletteMode::File => {
+                if let Some(selected) = self.palette.selected_result().map(str::to_string) {
+                    if let Some(path) = self.file_tree.find_full_path_by_display(&selected) {
+                        let path = path.clone();
+                        self.editor.open_file(&path)?;
+                        self.editor.ensure_cursor_visible(
+                            self.editor_view_height,
+                            self.editor_view_width,
+                        );
+                        let _ = self.sync_current_buffer_open();
+                        self.status = format!("Opened {}", selected);
+                    }
+                }
+                self.palette.close();
+                self.focus = FocusPane::Editor;
+                Ok(Action::None)
+            }
+            PaletteMode::Command => {
+                if let Some(command) = self.command_results.get(self.palette.selected).cloned() {
+                    self.palette.close();
+                    self.focus = FocusPane::Editor;
+
+                    match command.target {
+                        PaletteCommandTarget::BuiltIn(id) => self.execute_command(id),
+                        PaletteCommandTarget::Plugin {
+                            plugin_name,
+                            command_name,
+                        } => {
+                            self.execute_plugin_command(&plugin_name, &command_name)?;
+                            Ok(Action::None)
+                        }
+                    }
+                } else {
+                    Ok(Action::None)
+                }
+            }
+        }
+    }
+
+    fn submit_search_selection(&mut self) -> Result<Action> {
+        if let Some(result) = self.search.selected_result().cloned() {
+            let path = result.path.clone();
+            let line = result.line;
+            if let Err(e) = self.editor.open_file(&path) {
+                self.status = format!("Cannot open {}: {e}", path.display());
+                return Ok(Action::None);
+            }
+            self.editor.current_buffer_mut().cursor_row = line as usize;
+            self.editor.current_buffer_mut().cursor_col = 0;
+            self.editor
+                .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
+            let _ = self.sync_current_buffer_open();
+            self.search.close();
+            self.focus = FocusPane::Editor;
+            self.status = format!("Jumped to {}:{}", path.display(), line + 1);
+        }
+
         Ok(Action::None)
     }
 

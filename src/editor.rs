@@ -38,6 +38,8 @@ pub struct Editor {
     pub buffers: Vec<Buffer>,
     pub active: usize,
     pub syntax: SyntaxHighlighter,
+    pub tab_width: usize,
+    pub soft_tabs: bool,
 }
 
 impl Default for Editor {
@@ -46,11 +48,18 @@ impl Default for Editor {
             buffers: vec![Buffer::default()],
             active: 0,
             syntax: SyntaxHighlighter::new(),
+            tab_width: 4,
+            soft_tabs: true,
         }
     }
 }
 
 impl Editor {
+    pub fn configure(&mut self, tab_width: usize, soft_tabs: bool) {
+        self.tab_width = tab_width.max(1);
+        self.soft_tabs = soft_tabs;
+    }
+
     pub fn open_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let path = path.as_ref().to_path_buf();
 
@@ -125,6 +134,7 @@ impl Editor {
             KeyCode::PageDown => self.page_down(),
             KeyCode::Backspace => return self.backspace(),
             KeyCode::Enter => return self.insert_char('\n'),
+            KeyCode::Tab => return self.insert_tab(),
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return self.insert_char(c);
             }
@@ -286,6 +296,19 @@ impl Editor {
         }
 
         true
+    }
+
+    fn insert_tab(&mut self) -> bool {
+        if self.soft_tabs {
+            let cursor_col = self.current_buffer().cursor_col;
+            let spaces = self.tab_width - (cursor_col % self.tab_width);
+            for _ in 0..spaces.max(1) {
+                let _ = self.insert_char(' ');
+            }
+            true
+        } else {
+            self.insert_char('\t')
+        }
     }
 
     fn backspace(&mut self) -> bool {
