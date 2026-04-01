@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -8,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
     commands::{CommandId, CommandRegistry, PaletteCommandEntry, PaletteCommandTarget},
-    config::Config,
+    config::{ConfigIssueLevel, ConfigLoadReport},
     editor::Editor,
     file_tree::FileTree,
     keybindings::{EditorAction, KeyContext, KeybindingRegistry},
@@ -19,6 +20,7 @@ use crate::{
         CommandExecutionContext, CursorPosition, PluginCommandResult, PluginManager,
         PluginStartupSummary,
     },
+    prompt::{InputPrompt, PromptKind},
     search::SearchPanel,
     terminal::TerminalPane,
     theme::Theme,
@@ -64,6 +66,7 @@ pub struct App {
     pub editor: Editor,
     pub palette: CommandPalette,
     pub command_results: Vec<PaletteCommandEntry>,
+    pub prompt: InputPrompt,
     pub search: SearchPanel,
     pub terminal: TerminalPane,
     pub lsp: Option<LspClient>,
@@ -71,6 +74,8 @@ pub struct App {
     pub diagnostics: HashMap<PathBuf, Vec<LspDiagnostic>>,
     pub hover: Option<String>,
     pub hover_visible: bool,
+    pub keybinding_help_open: bool,
+    pub keybinding_help_selected: usize,
     /// Whether the diagnostics pane is visible in the bottom slot.
     pub diagnostics_open: bool,
     /// Highlighted row in the diagnostics list.
@@ -85,8 +90,9 @@ pub struct App {
 }
 
 impl App {
-    pub fn new<P: AsRef<Path>>(root: P, config: Config) -> Result<Self> {
+    pub fn new<P: AsRef<Path>>(root: P, config_report: ConfigLoadReport) -> Result<Self> {
         let root_dir = root.as_ref().canonicalize()?;
+        let config = config_report.config.clone();
         let file_tree = FileTree::new(&root_dir)?;
         let mut editor = Editor::default();
         editor.configure(config.editor.tab_width, config.editor.soft_tabs);
@@ -144,22 +150,26 @@ impl App {
             editor,
             palette: CommandPalette::default(),
             command_results: Vec::new(),
+            prompt: InputPrompt::default(),
             search: SearchPanel::default(),
             terminal,
             lsp,
             diagnostics: HashMap::new(),
             hover: None,
             hover_visible: false,
+            keybinding_help_open: false,
+            keybinding_help_selected: 0,
             diagnostics_open: false,
             diagnostics_selected: 0,
             diagnostics_entries: Vec::new(),
             focus: FocusPane::FileTree,
             should_quit: false,
-            status: initial_status(&root_dir, &plugin_startup),
+            status: initial_status(&root_dir, &plugin_startup, &config_report),
             editor_view_height: 1,
             editor_view_width: 1,
         };
 
+        app.apply_config_report(&config_report);
         let _ = app.sync_current_buffer_open();
         Ok(app)
     }
@@ -195,6 +205,12 @@ impl App {
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<Action> {
+        if self.prompt.open {
+            return self.handle_prompt_key(key);
+        }
+        if self.keybinding_help_open {
+            return self.handle_keybinding_help_key(key);
+        }
         if self.palette.open {
             return self.handle_palette_key(key);
         }
@@ -214,6 +230,27 @@ impl App {
             FocusPane::Terminal => self.handle_terminal_key(key),
             FocusPane::Diagnostics => self.handle_diagnostics_key(key),
         }
+    }
+
+    fn handle_prompt_key(&mut self, key: KeyEvent) -> Result<Action> {
+        if let Some(action) = self.keybindings.action_for(KeyContext::Prompt, key) {
+            return self.execute_editor_action(action);
+        }
+
+        match key.code {
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.prompt.input.push(c);
+            }
+            _ => {}
+        }
+        Ok(Action::None)
+    }
+
+    fn handle_keybinding_help_key(&mut self, key: KeyEvent) -> Result<Action> {
+        if let Some(action) = self.keybindings.action_for(KeyContext::KeybindingHelp, key) {
+            return self.execute_editor_action(action);
+        }
+        Ok(Action::None)
     }
 
     fn handle_file_tree_key(&mut self, key: KeyEvent) -> Result<Action> {
@@ -360,11 +397,24 @@ impl App {
                 self.status =
                     "File search  [type] filter  [>] commands  [Esc] close".to_string();
             }
+            CommandId::CreateFile => {
+                self.open_prompt(PromptKind::CreateFile);
+            }
+            CommandId::EditFile => {
+                self.open_prompt(PromptKind::EditFile);
+            }
             CommandId::SearchProject => {
                 self.search.open();
                 self.focus = FocusPane::Search;
                 self.status =
                     "Text search  [type to search]  [Enter] open  [Esc] close".to_string();
+            }
+            CommandId::GoToLine => {
+                if self.editor.current_buffer().file_path.is_some() {
+                    self.open_prompt(PromptKind::GoToLine);
+                } else {
+                    self.status = "Go to line unavailable: no file open".to_string();
+                }
             }
             CommandId::ToggleTerminal => {
                 self.terminal.toggle();
@@ -397,6 +447,21 @@ impl App {
             CommandId::Save => {
                 self.editor.save()?;
                 self.status = "Saved".to_string();
+            }
+            CommandId::CloseTab => {
+                if self.editor.close_active_buffer() {
+                    self.editor
+                        .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
+                    let _ = self.sync_current_buffer_open();
+                    self.status = format!("Closed tab: {}", self.editor.title());
+                } else {
+                    self.status = "Cannot close tab with unsaved changes".to_string();
+                }
+            }
+            CommandId::ShowKeybindings => {
+                self.keybinding_help_open = true;
+                self.keybinding_help_selected = 0;
+                self.status = "Keybindings  [↑↓/PgUp/PgDn] scroll  [Esc] close".to_string();
             }
             CommandId::Quit => {
                 self.should_quit = true;
@@ -626,6 +691,45 @@ impl App {
                 self.status = "Closed diagnostics".to_string();
                 Ok(Action::None)
             }
+            EditorAction::PromptClose => {
+                self.prompt.close();
+                self.status = "Closed prompt".to_string();
+                Ok(Action::None)
+            }
+            EditorAction::PromptBackspace => {
+                self.prompt.input.pop();
+                Ok(Action::None)
+            }
+            EditorAction::PromptSubmit => self.submit_prompt(),
+            EditorAction::KeybindingHelpClose => {
+                self.keybinding_help_open = false;
+                self.status = "Closed keybindings".to_string();
+                Ok(Action::None)
+            }
+            EditorAction::KeybindingHelpMoveUp => {
+                if self.keybinding_help_selected > 0 {
+                    self.keybinding_help_selected -= 1;
+                }
+                Ok(Action::None)
+            }
+            EditorAction::KeybindingHelpMoveDown => {
+                let max_index = self.keybindings.help_entries().len().saturating_sub(1);
+                if self.keybinding_help_selected < max_index {
+                    self.keybinding_help_selected += 1;
+                }
+                Ok(Action::None)
+            }
+            EditorAction::KeybindingHelpPageUp => {
+                self.keybinding_help_selected =
+                    self.keybinding_help_selected.saturating_sub(10);
+                Ok(Action::None)
+            }
+            EditorAction::KeybindingHelpPageDown => {
+                let max_index = self.keybindings.help_entries().len().saturating_sub(1);
+                self.keybinding_help_selected =
+                    (self.keybinding_help_selected + 10).min(max_index);
+                Ok(Action::None)
+            }
         }
     }
 
@@ -694,8 +798,7 @@ impl App {
                 self.status = format!("Cannot open {}: {e}", path.display());
                 return Ok(Action::None);
             }
-            self.editor.current_buffer_mut().cursor_row = line as usize;
-            self.editor.current_buffer_mut().cursor_col = 0;
+            self.editor.jump_to(line as usize, 0);
             self.editor
                 .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
             let _ = self.sync_current_buffer_open();
@@ -705,6 +808,139 @@ impl App {
         }
 
         Ok(Action::None)
+    }
+
+    fn open_prompt(&mut self, kind: PromptKind) {
+        let initial_input = match kind {
+            PromptKind::GoToLine => format!("{}", self.editor.current_buffer().cursor_row + 1),
+            PromptKind::CreateFile => String::new(),
+            PromptKind::EditFile => self.current_buffer_relative_path(),
+        };
+
+        self.prompt.open(kind, initial_input);
+        self.status = match kind {
+            PromptKind::GoToLine => "Go to line  [Enter] jump  [Esc] close".to_string(),
+            PromptKind::CreateFile => "Create file  [Enter] create  [Esc] close".to_string(),
+            PromptKind::EditFile => "Edit file  [Enter] open  [Esc] close".to_string(),
+        };
+    }
+
+    fn submit_prompt(&mut self) -> Result<Action> {
+        let Some(kind) = self.prompt.kind() else {
+            return Ok(Action::None);
+        };
+
+        match kind {
+            PromptKind::GoToLine => self.submit_go_to_line_prompt(),
+            PromptKind::CreateFile => self.submit_create_file_prompt(),
+            PromptKind::EditFile => self.submit_edit_file_prompt(),
+        }
+    }
+
+    fn submit_go_to_line_prompt(&mut self) -> Result<Action> {
+        let Some((line, column)) = parse_line_spec(&self.prompt.input) else {
+            self.status = "Go to line expects line or line:column".to_string();
+            return Ok(Action::None);
+        };
+
+        self.editor.jump_to(line.saturating_sub(1), column.saturating_sub(1));
+        self.editor
+            .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
+        self.prompt.close();
+        self.focus = FocusPane::Editor;
+        self.status = format!("Jumped to line {}, column {}", line, column);
+        Ok(Action::None)
+    }
+
+    fn submit_create_file_prompt(&mut self) -> Result<Action> {
+        let raw_path = self.prompt.input.trim();
+        if raw_path.is_empty() {
+            self.status = "Create file requires a path".to_string();
+            return Ok(Action::None);
+        }
+
+        let path = self.resolve_workspace_path(raw_path);
+        if path.exists() {
+            self.status = format!("Create file: already exists — {}", path.display());
+            return Ok(Action::None);
+        }
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, "")?;
+        self.file_tree.reload(&self.root_dir)?;
+        self.editor.open_file(&path)?;
+        self.editor
+            .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
+        let _ = self.sync_current_buffer_open();
+        self.prompt.close();
+        self.focus = FocusPane::Editor;
+        self.status = format!("Created {}", path.display());
+        Ok(Action::None)
+    }
+
+    fn submit_edit_file_prompt(&mut self) -> Result<Action> {
+        let raw_path = self.prompt.input.trim();
+        if raw_path.is_empty() {
+            self.status = "Edit file requires a path".to_string();
+            return Ok(Action::None);
+        }
+
+        let path = self.resolve_workspace_path(raw_path);
+        if !path.is_file() {
+            self.status = format!("Edit file: not found — {}", path.display());
+            return Ok(Action::None);
+        }
+
+        self.editor.open_file(&path)?;
+        self.editor
+            .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
+        let _ = self.sync_current_buffer_open();
+        self.prompt.close();
+        self.focus = FocusPane::Editor;
+        self.status = format!("Opened {}", path.display());
+        Ok(Action::None)
+    }
+
+    fn resolve_workspace_path(&self, raw_path: &str) -> PathBuf {
+        let path = PathBuf::from(raw_path.trim());
+        if path.is_absolute() {
+            path
+        } else {
+            self.root_dir.join(path)
+        }
+    }
+
+    fn current_buffer_relative_path(&self) -> String {
+        self.editor
+            .current_buffer()
+            .file_path
+            .as_ref()
+            .and_then(|path| path.strip_prefix(&self.root_dir).ok())
+            .map(|path| path.display().to_string())
+            .unwrap_or_default()
+    }
+
+    fn apply_config_report(&mut self, report: &ConfigLoadReport) {
+        if report.has_issues() {
+            self.terminal.push_system_message(&format!(
+                "[config] loaded with issues from {}",
+                report.path.display()
+            ));
+        }
+
+        for issue in &report.issues {
+            let level = match issue.level {
+                ConfigIssueLevel::Warning => "warning",
+                ConfigIssueLevel::Error => "error",
+            };
+
+            self.terminal.push_system_message(&format!(
+                "[config:{level}] {}",
+                issue.message
+            ));
+        }
     }
 
     // ── LSP event handling ────────────────────────────────────────────────────
@@ -826,11 +1062,7 @@ impl App {
             return;
         }
 
-        {
-            let buf = self.editor.current_buffer_mut();
-            buf.cursor_row = line as usize;
-            buf.cursor_col = character as usize;
-        }
+        self.editor.jump_to(line as usize, character as usize);
 
         self.editor
             .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
@@ -943,11 +1175,7 @@ impl App {
             self.status = format!("Definition: failed to open {}: {e}", path.display());
             return;
         }
-        {
-            let buf = self.editor.current_buffer_mut();
-            buf.cursor_row = line as usize;
-            buf.cursor_col = character as usize;
-        }
+        self.editor.jump_to(line as usize, character as usize);
         self.editor
             .ensure_cursor_visible(self.editor_view_height, self.editor_view_width);
         let _ = self.sync_current_buffer_open();
@@ -965,8 +1193,12 @@ impl App {
     }
 }
 
-fn initial_status(root_dir: &Path, plugin_startup: &PluginStartupSummary) -> String {
-    match (plugin_startup.started_count(), plugin_startup.failed_count()) {
+fn initial_status(
+    root_dir: &Path,
+    plugin_startup: &PluginStartupSummary,
+    config_report: &ConfigLoadReport,
+) -> String {
+    let mut status = match (plugin_startup.started_count(), plugin_startup.failed_count()) {
         (0, 0) => format!("Noir ready — {}", root_dir.display()),
         (started, 0) => format!(
             "Noir ready — {} | plugins: {} started",
@@ -979,7 +1211,14 @@ fn initial_status(root_dir: &Path, plugin_startup: &PluginStartupSummary) -> Str
             started,
             failed
         ),
+    };
+
+    if let Some(summary) = config_report.summary() {
+        status.push_str(" | ");
+        status.push_str(&summary);
     }
+
+    status
 }
 
 fn severity_sort_key(severity: Option<DiagnosticSeverity>) -> u8 {
@@ -990,4 +1229,24 @@ fn severity_sort_key(severity: Option<DiagnosticSeverity>) -> u8 {
         Some(DiagnosticSeverity::HINT) => 3,
         _ => 4,
     }
+}
+
+fn parse_line_spec(input: &str) -> Option<(usize, usize)> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut parts = trimmed.splitn(2, ':');
+    let line = parts.next()?.trim().parse::<usize>().ok()?;
+    let column = match parts.next() {
+        Some(part) => part.trim().parse::<usize>().ok()?,
+        None => 1,
+    };
+
+    if line == 0 || column == 0 {
+        return None;
+    }
+
+    Some((line, column))
 }

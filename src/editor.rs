@@ -72,7 +72,7 @@ impl Editor {
             return Ok(());
         }
 
-        let content = fs::read_to_string(&path).unwrap_or_default();
+        let content = fs::read_to_string(&path)?;
         let buffer = Buffer {
             file_path: Some(path),
             rope: Rope::from_str(&content),
@@ -84,8 +84,13 @@ impl Editor {
             dirty: false,
         };
 
-        self.buffers.push(buffer);
-        self.active = self.buffers.len() - 1;
+        if self.should_replace_placeholder_buffer() {
+            self.buffers[0] = buffer;
+            self.active = 0;
+        } else {
+            self.buffers.push(buffer);
+            self.active = self.buffers.len() - 1;
+        }
         Ok(())
     }
 
@@ -112,6 +117,24 @@ impl Editor {
                 self.active - 1
             };
         }
+    }
+
+    pub fn close_active_buffer(&mut self) -> bool {
+        if self.current_buffer().dirty {
+            return false;
+        }
+
+        if self.buffers.len() == 1 {
+            self.buffers[0] = Buffer::default();
+            self.active = 0;
+            return true;
+        }
+
+        self.buffers.remove(self.active);
+        if self.active >= self.buffers.len() {
+            self.active = self.buffers.len() - 1;
+        }
+        true
     }
 
     pub fn current_buffer(&self) -> &Buffer {
@@ -246,6 +269,15 @@ impl Editor {
             buf.cursor_row as u32,
             self.utf8_offset_for_col(buf.cursor_row, buf.cursor_col) as u32,
         )
+    }
+
+    pub fn jump_to(&mut self, row: usize, col: usize) {
+        let max_row = self.current_buffer().rope.len_lines().saturating_sub(1);
+        let row = row.min(max_row);
+        let col = col.min(self.line_len_chars(row));
+        let buf = self.current_buffer_mut();
+        buf.cursor_row = row;
+        buf.cursor_col = col;
     }
 
     fn line_len_chars(&self, row: usize) -> usize {
@@ -454,5 +486,18 @@ impl Editor {
             .take(col)
             .map(char::len_utf8)
             .sum()
+    }
+
+    fn should_replace_placeholder_buffer(&self) -> bool {
+        if self.buffers.len() != 1 {
+            return false;
+        }
+
+        let buffer = &self.buffers[0];
+        buffer.file_path.is_none()
+            && !buffer.dirty
+            && buffer.cursor_row == 0
+            && buffer.cursor_col == 0
+            && buffer.rope.len_chars() == 0
     }
 }

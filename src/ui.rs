@@ -85,6 +85,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.hover_visible {
         draw_hover(frame, centered_rect(60, 40, frame.area()), app);
     }
+
+    if app.prompt.open {
+        draw_prompt(frame, centered_rect(60, 18, frame.area()), app);
+    }
+
+    if app.keybinding_help_open {
+        draw_keybinding_help(frame, centered_rect(70, 70, frame.area()), app);
+    }
 }
 
 fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
@@ -642,6 +650,94 @@ fn draw_palette(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Clear, area);
     frame.render_widget(input, sections[0]);
     frame.render_stateful_widget(results, sections[1], &mut state);
+}
+
+fn draw_prompt(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(kind) = app.prompt.kind() else { return };
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Length(2), Constraint::Length(1)])
+        .split(area);
+
+    let input = Paragraph::new(format!("{}_", app.prompt.input))
+        .block(
+            Block::default()
+                .title(kind.title())
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.accent)),
+        )
+        .alignment(Alignment::Left);
+
+    let hint = Paragraph::new(kind.hint()).style(Style::default().fg(app.theme.muted));
+    let footer = Paragraph::new("[Enter] submit  [Esc] close")
+        .style(Style::default().fg(app.theme.muted))
+        .alignment(Alignment::Right);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(input, sections[0]);
+    frame.render_widget(hint, sections[1]);
+    frame.render_widget(footer, sections[2]);
+}
+
+fn draw_keybinding_help(frame: &mut Frame, area: Rect, app: &App) {
+    let entries = app.keybindings.help_entries();
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+
+    let inner_height = sections[0].height.saturating_sub(2) as usize;
+    let start = app
+        .keybinding_help_selected
+        .saturating_sub(inner_height.saturating_sub(1));
+    let end = (start + inner_height).min(entries.len());
+
+    let items: Vec<ListItem> = entries[start..end]
+        .iter()
+        .map(|entry| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:<12}", entry.context),
+                    Style::default().fg(app.theme.accent_alt),
+                ),
+                Span::styled(
+                    format!("{:<14}", entry.shortcut),
+                    Style::default()
+                        .fg(app.theme.text)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(entry.description, Style::default().fg(app.theme.muted)),
+            ]))
+        })
+        .collect();
+
+    let help = List::new(items)
+        .block(
+            Block::default()
+                .title(" Keybindings ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.accent)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(app.theme.selection_bg)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("› ");
+
+    let mut state = ListState::default();
+    if !entries.is_empty() {
+        state.select(Some(app.keybinding_help_selected.saturating_sub(start)));
+    }
+
+    let footer = Paragraph::new("[↑↓/PgUp/PgDn] scroll  [Esc] close")
+        .style(Style::default().fg(app.theme.muted))
+        .alignment(Alignment::Right);
+
+    frame.render_widget(Clear, area);
+    frame.render_stateful_widget(help, sections[0], &mut state);
+    frame.render_widget(footer, sections[1]);
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

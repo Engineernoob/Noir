@@ -2,12 +2,13 @@ mod app;
 mod commands;
 mod config;
 mod editor;
-mod plugins;
 mod file_tree;
 mod keybindings;
 mod languages;
 mod lsp;
 mod palette;
+mod plugins;
+mod prompt;
 mod search;
 mod syntax;
 mod terminal;
@@ -34,10 +35,10 @@ use config::Config;
 
 fn main() -> Result<()> {
     let root = env::args().nth(1).unwrap_or_else(|| ".".to_string());
-    let config = Config::load()?;
+    let config_report = Config::load();
 
     let mut terminal = setup_terminal()?;
-    let result = run_app(&mut terminal, App::new(root, config)?);
+    let result = run_app(&mut terminal, App::new(root, config_report)?);
     restore_terminal(&mut terminal)?;
 
     result

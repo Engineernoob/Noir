@@ -32,6 +32,14 @@ impl Theme {
             _ => NOIR,
         }
     }
+
+    pub fn supports_name(name: &str) -> bool {
+        matches!(name.trim().to_ascii_lowercase().as_str(), "noir" | "daylight")
+    }
+
+    pub fn default_name() -> &'static str {
+        "noir"
+    }
 }
 
 pub const NOIR: Theme = Theme {

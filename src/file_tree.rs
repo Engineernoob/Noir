@@ -63,6 +63,18 @@ impl FileTree {
         })
     }
 
+    pub fn reload(&mut self, root: &Path) -> Result<()> {
+        let selected_path = self.flat.get(self.selected).map(|entry| entry.full_path.clone());
+        let mut rebuilt = Self::new(root)?;
+
+        if let Some(path) = selected_path {
+            rebuilt.select_path(&path);
+        }
+
+        *self = rebuilt;
+        Ok(())
+    }
+
     // ── Navigation ──────────────────────────────────────────────────────────
 
     pub fn move_up(&mut self) {
@@ -180,6 +192,12 @@ impl FileTree {
     fn clamp_selected(&mut self) {
         if !self.flat.is_empty() && self.selected >= self.flat.len() {
             self.selected = self.flat.len() - 1;
+        }
+    }
+
+    fn select_path(&mut self, path: &Path) {
+        if let Some(index) = self.flat.iter().position(|entry| entry.full_path == path) {
+            self.selected = index;
         }
     }
 }

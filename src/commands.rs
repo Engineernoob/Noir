@@ -5,7 +5,10 @@ use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandId {
     OpenFile,
+    CreateFile,
+    EditFile,
     SearchProject,
+    GoToLine,
     ToggleTerminal,
     GotoDefinition,
     Hover,
@@ -13,6 +16,8 @@ pub enum CommandId {
     FocusFileTree,
     FocusEditor,
     Save,
+    CloseTab,
+    ShowKeybindings,
     Quit,
 }
 
@@ -63,9 +68,24 @@ impl CommandRegistry {
                     description: "Open a file from the project tree",
                 },
                 Command {
+                    id: CommandId::CreateFile,
+                    name: "Create File",
+                    description: "Create a new file and open it in the editor",
+                },
+                Command {
+                    id: CommandId::EditFile,
+                    name: "Edit File",
+                    description: "Open an existing file by path",
+                },
+                Command {
                     id: CommandId::SearchProject,
                     name: "Search Project",
                     description: "Search for text across all project files",
+                },
+                Command {
+                    id: CommandId::GoToLine,
+                    name: "Go to Line",
+                    description: "Jump to a specific line or line:column",
                 },
                 Command {
                     id: CommandId::ToggleTerminal,
@@ -101,6 +121,16 @@ impl CommandRegistry {
                     id: CommandId::Save,
                     name: "Save File",
                     description: "Save the current file",
+                },
+                Command {
+                    id: CommandId::CloseTab,
+                    name: "Close Tab",
+                    description: "Close the current editor tab",
+                },
+                Command {
+                    id: CommandId::ShowKeybindings,
+                    name: "Show Keybindings",
+                    description: "List available keyboard shortcuts",
                 },
                 Command {
                     id: CommandId::Quit,
