@@ -7,13 +7,16 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
-    commands::{CommandId, CommandRegistry},
+    commands::{CommandId, CommandRegistry, PaletteCommandEntry, PaletteCommandTarget},
     editor::Editor,
     file_tree::FileTree,
     languages::LanguageRegistry,
     lsp::{DiagnosticSeverity, LspClient, LspDiagnostic, LspEvent},
     palette::{CommandPalette, PaletteMode},
-    plugins::PluginManager,
+    plugins::{
+        CommandExecutionContext, CursorPosition, PluginCommandResult, PluginManager,
+        PluginStartupSummary,
+    },
     search::SearchPanel,
     terminal::TerminalPane,
 };
@@ -53,6 +56,7 @@ pub struct App {
     pub file_tree: FileTree,
     pub editor: Editor,
     pub palette: CommandPalette,
+    pub command_results: Vec<PaletteCommandEntry>,
     pub search: SearchPanel,
     pub terminal: TerminalPane,
     pub lsp: Option<LspClient>,
@@ -111,6 +115,7 @@ impl App {
         // Discover plugins from `<root>/.noir/plugins/`. Missing directory is fine.
         let mut plugins = PluginManager::new();
         let _ = plugins.discover(&root_dir.join(".noir").join("plugins"));
+        let plugin_startup = plugins.start_enabled();
 
         let mut app = Self {
             root_dir: root_dir.clone(),
@@ -120,6 +125,7 @@ impl App {
             file_tree,
             editor,
             palette: CommandPalette::default(),
+            command_results: Vec::new(),
             search: SearchPanel::default(),
             terminal,
             lsp,
@@ -131,7 +137,7 @@ impl App {
             diagnostics_entries: Vec::new(),
             focus: FocusPane::FileTree,
             should_quit: false,
-            status: format!("Noir ready — {}", root_dir.display()),
+            status: initial_status(&root_dir, &plugin_startup),
             editor_view_height: 1,
             editor_view_width: 1,
         };
@@ -142,6 +148,11 @@ impl App {
 
     pub fn tick(&mut self) {
         self.terminal.poll_output();
+        self.poll_plugin_results();
+
+        if self.palette.open && self.palette.mode == PaletteMode::Command {
+            self.refresh_palette_results();
+        }
 
         let events = if let Some(lsp) = &mut self.lsp {
             lsp.drain_events()
@@ -410,12 +421,22 @@ impl App {
                         self.focus = FocusPane::Editor;
                     }
                     PaletteMode::Command => {
-                        if let Some(name) = self.palette.selected_result().map(str::to_string) {
-                            if let Some(cmd) = self.commands.find_by_name(&name) {
-                                let id = cmd.id;
-                                self.palette.close();
-                                self.focus = FocusPane::Editor;
-                                return self.execute_command(id);
+                        if let Some(command) =
+                            self.command_results.get(self.palette.selected).cloned()
+                        {
+                            self.palette.close();
+                            self.focus = FocusPane::Editor;
+
+                            match command.target {
+                                PaletteCommandTarget::BuiltIn(id) => {
+                                    return self.execute_command(id);
+                                }
+                                PaletteCommandTarget::Plugin {
+                                    plugin_name,
+                                    command_name,
+                                } => {
+                                    self.execute_plugin_command(&plugin_name, &command_name)?;
+                                }
                             }
                         }
                     }
@@ -437,6 +458,61 @@ impl App {
         Ok(Action::None)
     }
 
+    fn execute_plugin_command(&mut self, plugin_name: &str, command_name: &str) -> Result<()> {
+        let buffer = self.editor.current_buffer();
+        let context = CommandExecutionContext {
+            workspace_root: self.root_dir.display().to_string(),
+            active_file_path: buffer
+                .file_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            cursor: Some(CursorPosition {
+                line: buffer.cursor_row as u32,
+                column: buffer.cursor_col as u32,
+            }),
+        };
+
+        let request_id = self
+            .plugins
+            .execute_command(plugin_name, command_name, context)?;
+
+        self.terminal.visible = true;
+        self.terminal.push_system_message(&format!(
+            "[plugin:{plugin_name}] execute {command_name} (request #{request_id})"
+        ));
+        self.status = format!("Plugin command sent: {} ({})", plugin_name, command_name);
+
+        Ok(())
+    }
+
+    fn poll_plugin_results(&mut self) {
+        for result in self.plugins.drain_command_results() {
+            self.render_plugin_result(result);
+        }
+    }
+
+    fn render_plugin_result(&mut self, result: PluginCommandResult) {
+        self.terminal.visible = true;
+
+        let status = if result.success { "ok" } else { "error" };
+        let mut message = format!(
+            "[plugin:{}] {} (request #{}, {})",
+            result.plugin_name, result.command_name, result.request_id, status
+        );
+
+        if !result.output.trim().is_empty() {
+            message.push('\n');
+            message.push_str(&result.output);
+        }
+
+        self.terminal.push_system_message(&message);
+        self.status = format!(
+            "Plugin {}: {}",
+            if result.success { "completed" } else { "failed" },
+            result.command_name
+        );
+    }
+
     /// Populate palette results based on the current mode.
     fn refresh_palette_results(&mut self) {
         match self.palette.mode {
@@ -445,13 +521,27 @@ impl App {
                     .update_results(self.file_tree.all_display_paths());
             }
             PaletteMode::Command => {
-                let names: Vec<String> = self
+                self.command_results = self
                     .commands
-                    .fuzzy_filter(&self.palette.input)
-                    .into_iter()
-                    .map(|c| c.name.to_string())
+                    .fuzzy_filter(
+                        &self.palette.input,
+                        self.plugins
+                            .registered_commands()
+                            .into_iter()
+                            .map(|command| PaletteCommandEntry {
+                                title: command.title,
+                                description: command.description,
+                                target: PaletteCommandTarget::Plugin {
+                                    plugin_name: command.plugin_name,
+                                    command_name: command.command_name,
+                                },
+                            }),
+                    );
+                self.palette.results = self
+                    .command_results
+                    .iter()
+                    .map(|command| command.title.clone())
                     .collect();
-                self.palette.results = names;
                 if self.palette.selected >= self.palette.results.len() {
                     self.palette.selected = self.palette.results.len().saturating_sub(1);
                 }
@@ -860,6 +950,23 @@ impl App {
             let _ = lsp.shutdown();
             let _ = lsp.exit();
         }
+    }
+}
+
+fn initial_status(root_dir: &Path, plugin_startup: &PluginStartupSummary) -> String {
+    match (plugin_startup.started_count(), plugin_startup.failed_count()) {
+        (0, 0) => format!("Noir ready — {}", root_dir.display()),
+        (started, 0) => format!(
+            "Noir ready — {} | plugins: {} started",
+            root_dir.display(),
+            started
+        ),
+        (started, failed) => format!(
+            "Noir ready — {} | plugins: {} started, {} failed",
+            root_dir.display(),
+            started,
+            failed
+        ),
     }
 }
 

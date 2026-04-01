@@ -574,23 +574,17 @@ fn draw_palette(frame: &mut Frame, area: Rect, app: &App) {
                 .map(|result| ListItem::new(result.clone()))
                 .collect(),
             PaletteMode::Command => app
-                .palette
-                .results
+                .command_results
                 .iter()
-                .map(|name| {
-                    let desc = app
-                        .commands
-                        .find_by_name(name)
-                        .map(|c| c.description)
-                        .unwrap_or("");
+                .map(|command| {
                     ListItem::new(Line::from(vec![
                         Span::styled(
-                            format!("{name:<28}"),
+                            format!("{:<28}", command.title),
                             Style::default()
                                 .fg(Color::White)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(desc, Style::default().fg(Color::DarkGray)),
+                        Span::styled(&command.description, Style::default().fg(Color::DarkGray)),
                     ]))
                 })
                 .collect(),

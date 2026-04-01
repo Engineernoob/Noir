@@ -18,10 +18,27 @@ pub enum CommandId {
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone)]
 pub struct Command {
     pub id: CommandId,
     pub name: &'static str,
     pub description: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaletteCommandTarget {
+    BuiltIn(CommandId),
+    Plugin {
+        plugin_name: String,
+        command_name: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteCommandEntry {
+    pub title: String,
+    pub description: String,
+    pub target: PaletteCommandTarget,
 }
 
 // ── CommandRegistry ───────────────────────────────────────────────────────────
@@ -94,25 +111,41 @@ impl CommandRegistry {
         }
     }
 
-    /// Fuzzy-filter commands by `query`, returning up to 20 ranked results.
-    pub fn fuzzy_filter(&self, query: &str) -> Vec<&Command> {
-        let matcher = SkimMatcherV2::default();
-        let mut scored: Vec<(i64, &Command)> = self
-            .commands
+    pub fn built_in_palette_commands(&self) -> Vec<PaletteCommandEntry> {
+        self.commands
             .iter()
+            .map(|cmd| PaletteCommandEntry {
+                title: cmd.name.to_string(),
+                description: cmd.description.to_string(),
+                target: PaletteCommandTarget::BuiltIn(cmd.id),
+            })
+            .collect()
+    }
+
+    /// Fuzzy-filter command entries by `query`, returning up to 20 ranked results.
+    pub fn fuzzy_filter(
+        &self,
+        query: &str,
+        extra_commands: impl IntoIterator<Item = PaletteCommandEntry>,
+    ) -> Vec<PaletteCommandEntry> {
+        let matcher = SkimMatcherV2::default();
+
+        let mut candidates = self.built_in_palette_commands();
+        candidates.extend(extra_commands);
+
+        let mut scored: Vec<(i64, PaletteCommandEntry)> = candidates
+            .into_iter()
             .filter_map(|cmd| {
                 if query.is_empty() {
                     Some((0, cmd))
                 } else {
-                    matcher.fuzzy_match(cmd.name, query).map(|s| (s, cmd))
+                    matcher.fuzzy_match(&cmd.title, query).map(|s| (s, cmd))
                 }
             })
             .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
-        scored.into_iter().map(|(_, cmd)| cmd).take(20).collect()
-    }
 
-    pub fn find_by_name(&self, name: &str) -> Option<&Command> {
-        self.commands.iter().find(|c| c.name == name)
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.title.cmp(&b.1.title)));
+
+        scored.into_iter().map(|(_, cmd)| cmd).take(20).collect()
     }
 }

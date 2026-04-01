@@ -122,6 +122,10 @@ impl TerminalPane {
         self.send_input("\u{7f}");
     }
 
+    pub fn push_system_message(&mut self, message: &str) {
+        self.push_output_chunk(message);
+    }
+
     pub fn visible_lines(&self, height: usize) -> Vec<String> {
         let total = self.lines.len();
         if total == 0 {
