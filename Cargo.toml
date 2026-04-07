@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[[bin]]
+name = "noir"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
 crossterm = "0.29"
